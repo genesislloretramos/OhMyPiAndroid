@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <com.omp.terminal.TerminalView
+            android:id="@+id/terminalView"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+
+        <com.omp.terminal.ExtraKeysView
+            android:id="@+id/extraKeys"
+            android:layout_width="match_parent"
+            android:layout_height="44dp" />
+    </LinearLayout>
+
+    <!-- Invisible IME sink, kept last so it sits on top of the terminal and can take focus.
+         showSoftInputOnFocus is set in code: it is a TextView setter, not a public XML attribute. -->
+    <EditText
+        android:id="@+id/imeInput"
+        android:layout_width="1dp"
+        android:layout_height="1dp"
+        android:alpha="0"
+        android:cursorVisible="false"
+        android:focusable="true"
+        android:focusableInTouchMode="true"
+        android:importantForAutofill="no"
+        android:inputType="none" />
+</FrameLayout>
