@@ -162,7 +162,9 @@ object Agent {
         ctx.outLine("  ${Tools.NO_RUN}")
         ctx.outLine()
         ctx.outLine("  outside a conversation omp is the launcher: 'omp new NAME', 'omp ls',")
-        ctx.outLine("  'omp rm NAME --force', and a bare name to open one")
+        ctx.outLine("  'omp rm NAME --force', a bare name to open one, and 'omp provision', which is")
+        ctx.outLine("  the only verb that downloads: the Debian and the real agent, on the phone's own")
+        ctx.outLine("  shell, after it has printed what they cost and been answered to")
         ctx.flush()
         return ExecContext.EXIT_OK
     }

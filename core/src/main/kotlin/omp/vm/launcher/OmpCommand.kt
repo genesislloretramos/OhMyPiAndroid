@@ -62,14 +62,27 @@ import omp.vm.workspace.WorkspaceList
  */
 @CommandSpec(
     name = "omp",
-    synopsis = "[--yes] [NAME | new [NAME] | ls | rm NAME --force | run | key [OPTION] | update | help]",
+    synopsis = "[--yes] [NAME | new [NAME] | ls | rm NAME --force | provision [--yes] | run | key [OPTION] | update | help]",
     group = "system",
     notes = "conversations are plain folders in Internal storage ▸ Documents ▸ omp, one folder each; " +
         "the folder owns its name, needs the grant-storage all-files grant, and is the same folder in the VM at /mnt/omp; " +
         "inside one, bare omp is the coding agent, with five file tools that reach that folder and nothing else, " +
-        "and 'omp --yes' approves the ones that write without asking",
+        "and 'omp --yes' approves the ones that write without asking; " +
+        "'omp provision' is the only verb that downloads: it prints the exact cost of the Debian, the " +
+        "agent and the guest's own LAMP before asking, and it is refused in the VM, where there is no path to either",
 )
-class OmpCommand : Command {
+class OmpCommand(
+    /**
+     * The one verb of this command that downloads, built here and handed in.
+     *
+     * **A parameter and not a `ProvisionCommand()` at the call site**, because the two seams a
+     * test needs are inside that class — the [omp.vm.provision.Transport] a body arrives on and
+     * the per-ABI table — and passing the object rather than its two settings keeps this command's
+     * own signature to one thing. Everything else about `omp` is unchanged by that: this is still
+     * the same command in the phone's table and in the namespace's copy of it.
+     */
+    private val provision: ProvisionCommand = ProvisionCommand(),
+) : Command {
 
     override fun run(ctx: ExecContext): Int {
         val args = ctx.args
@@ -83,6 +96,11 @@ class OmpCommand : Command {
         // running is approving nothing — and a flag quietly ignored where it does not apply is a
         // flag a user will believe is in force.
         if (first == YES) return withYes(ctx, args.drop(1))
+        // `provision` is a verb of the launcher and not of the agent, so it is dispatched here and
+        // not through [Agent.VERBS]. It moves 334 MB of a user's data, and that list is checked
+        // before a bare name is taken for a conversation: a verb in it is a name every conversation
+        // folder has to give up, and a download is not something a conversation may be called.
+        if (first == PROVISION) return provision.run(ctx, args.drop(1))
         return when (val sub = first) {
             null -> if (inConversation(ctx)) converse(ctx, emptyList(), false) else opener(ctx)
             "new" -> create(ctx, args.drop(1))
@@ -126,20 +144,6 @@ class OmpCommand : Command {
         "key" -> KeyCommand(ctx, Agent.store(ctx)).run(operands)
         "update" -> UpdateCommand(ctx, Agent.store(ctx)).run()
         else -> Agent.help(ctx)
-    }
-
-    /**
-     * Whether the session is standing in a conversation, which is what changes what `omp` means.
-     *
-     * **The working directory has to be inside the folder as well.** The environment is set once,
-     * by [enter], and a `cd ..` does not clear it — so a session that had walked out of the
-     * conversation would still be told it was in one, and bare `omp` would open an agent in a
-     * folder the user had already left. Asking the session where it is standing is the one answer
-     * that cannot go stale, and it is the answer the prompt is drawn from anyway.
-     */
-    private fun inConversation(ctx: ExecContext): Boolean {
-        val dir = ctx.env[ENV_WORKSPACE]?.takeIf { it.isNotBlank() } ?: return false
-        return within(ctx.session.cwd, dir)
     }
 
     /**
@@ -204,9 +208,9 @@ class OmpCommand : Command {
         ctx.outLine("type a number to continue, or n for a new one:")
         ctx.flush()
         val answer = ask(ctx)
-        if (answer is Answer.Cancelled) return cancelled(ctx)
-        if (answer is Answer.Empty) return emptyAnswer(ctx)
-        val typed = (answer as Answer.Typed).text
+        if (answer is TerminalAnswer.Cancelled) return cancelled(ctx)
+        if (answer is TerminalAnswer.Empty) return emptyAnswer(ctx)
+        val typed = (answer as TerminalAnswer.Typed).text
         if (typed.equals("n", ignoreCase = true)) return create(ctx, emptyList())
         val index = typed.toIntOrNull()
             ?: return ctx.fail("$USAGE: '$typed' is not a number and not n, so nothing was opened")
@@ -220,39 +224,13 @@ class OmpCommand : Command {
      * byte at a time from `ctx.stdin`, which in a session is the very [omp.shell.InputChannel] the
      * line editor reads, so a Ctrl-C arrives here as well as on the job it would cancel.
      *
-     * **Enter on an empty prompt is its own answer and not a cancellation.** It is the most likely
-     * mis-key there is — the second Enter of a double-Enter — and reporting it as `^C` would put a
-     * Ctrl-C in `$?` that never happened. Nothing is created or opened in either case, which is
-     * the whole point of asking before doing anything; only the sentence differs.
+     * **The reading itself is [askOnTerminal] and not a copy of it.** `omp provision` asks a second
+     * question on the same terminal, and a second implementation of "read one keystroke, honour a
+     * Ctrl-C, and tell an empty Enter from a cancellation" is a second implementation that will
+     * eventually disagree with this one in the case that matters: a terminal in a state where one of
+     * them blocks and the other returns.
      */
-    private fun ask(ctx: ExecContext): Answer {
-        val line = StringBuilder()
-        while (true) {
-            if (ctx.cancelled.get()) return Answer.Cancelled
-            val c = ctx.stdin.read()
-            if (c < 0 || c == CTRL_C) return Answer.Cancelled
-            if (c == '\n'.code || c == '\r'.code) {
-                val typed = line.toString().trim()
-                return if (typed.isEmpty()) Answer.Empty else Answer.Typed(typed)
-            }
-            if (c == 0x08 || c == 0x7F) {
-                if (line.isNotEmpty()) line.setLength(line.length - 1)
-            } else {
-                line.append(c.toChar())
-            }
-        }
-    }
-
-    /** What the prompt was answered with. A sealed class because all three say something different. */
-    private sealed class Answer {
-        data class Typed(val text: String) : Answer()
-
-        /** Enter on an empty prompt. */
-        object Empty : Answer()
-
-        /** A Ctrl-C, a closed channel, or a job cancelled while the question was on screen. */
-        object Cancelled : Answer()
-    }
+    private fun ask(ctx: ExecContext): TerminalAnswer = askOnTerminal(ctx)
 
     /**
      * Whether this command may take the terminal: [Agent.mayPrompt], and that is where the three
@@ -592,10 +570,6 @@ class OmpCommand : Command {
     /** `entry` or `entries`: the one place a count is turned into a word. */
     private fun plural(count: Int, one: String, many: String): String = if (count == 1) one else many
 
-    /** True when [path] is [dir] or something under it, on a path boundary. */
-    private fun within(path: String, dir: String): Boolean =
-        path == dir || path.startsWith(if (dir.endsWith('/')) dir else "$dir/")
-
     companion object {
         /** The namespace path of the conversation a session is in. `$PWD` says the same thing. */
         const val ENV_WORKSPACE = "OMP_WORKSPACE"
@@ -609,11 +583,35 @@ class OmpCommand : Command {
         private const val USAGE = "omp"
         private const val FORCE = "--force"
 
+        /**
+         * Whether the session is standing in a conversation, which is what changes what `omp` means.
+         *
+         * **The working directory has to be inside the folder as well.** The environment is set once,
+         * by [enter], and a `cd ..` does not clear it — so a session that had walked out of the
+         * conversation would still be told it was in one, and bare `omp` would open an agent in a
+         * folder the user had already left. Asking the session where it is standing is the one answer
+         * that cannot go stale, and it is the answer the prompt is drawn from anyway.
+         *
+         * In the companion and not on the instance because [ProvisionCommand] asks the same question
+         * for a different reason — an agent is not what fetches a Debian — and two definitions of
+         * "am I in a conversation" is one more thing that can be true in one command and false in
+         * the other.
+         */
+        internal fun inConversation(ctx: ExecContext): Boolean {
+            val dir = ctx.env[ENV_WORKSPACE]?.takeIf { it.isNotBlank() } ?: return false
+            return within(ctx.session.cwd, dir)
+        }
+
+        /** True when [path] is [dir] or something under it, on a path boundary. */
+        private fun within(path: String, dir: String): Boolean =
+            path == dir || path.startsWith(if (dir.endsWith('/')) dir else "$dir/")
+
         /** The flag that answers an approval prompt on the user's behalf, for this one turn. */
         private const val YES = "--yes"
-        private const val CTRL_C = 0x03
+        /** The one verb that spends mobile data, and the one that has to be asked about. */
+        private const val PROVISION = "provision"
         private const val USAGE_TEXT =
-            "omp [NAME|omp new [NAME]|omp ls|omp rm NAME $FORCE]\n" +
+            "omp [NAME|omp new [NAME]|omp ls|omp rm NAME $FORCE|omp $PROVISION [--yes]]\n" +
             "  inside a conversation: 'omp' is the coding agent — 'omp help' lists its verbs"
     }
 }
