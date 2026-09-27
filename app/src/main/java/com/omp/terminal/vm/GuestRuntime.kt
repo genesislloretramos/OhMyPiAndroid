@@ -7,6 +7,7 @@ import omp.vm.doctor.Doctor
 import omp.vm.guestapi.AgentUpdate
 import omp.vm.launcher.Containers
 import omp.vm.provision.Abi
+import omp.vm.provision.ArtifactManifest
 import omp.vm.provision.GuestPackages
 import omp.vm.provision.GuestStart
 import omp.vm.provision.GuestStartReport
@@ -170,15 +171,28 @@ object GuestRuntime {
             visibleDir = visible,
             agentDir = paths.agentDir,
         )
-        // One launcher for the steps that finish — `a2enconf`, and the boot's `omp update` — and one
-        // seam for the server that does not. Both are the same proot with the same environment; they
-        // differ only in whether the caller waits for the process to end, which is the whole
-        // difference between `omp.vm.provision.ProotLauncher` and `omp.vm.provision.GuestServer`.
+        // One launcher for the steps that finish — `a2enconf`, and the boot's `omp update` — one
+        // bound tighter for the one that can take minutes, and one seam for the server that does not
+        // finish at all. They differ only in how long the caller waits, which is the whole difference
+        // between `omp.vm.provision.ProotLauncher` and `omp.vm.provision.GuestServer`.
+        //
+        // **The install gets its own launcher because it is the only step with a bound of its own.**
+        // `GuestPackages.INSTALL_BOUND_MS` lives in `:core` because it is a fact about that step; the
+        // launcher that enforces it can only exist here, because only `ProotProcessLauncher` can
+        // destroy a process. It returns `GuestPackages.TIMED_OUT` (124) when it does, and the step
+        // reports that as `STOPPED` rather than as a failure — the same trade
+        // `omp.vm.guestapi.AgentUpdate` makes at 60 seconds, on the same terms.
+        val installer = NativeProot(
+            helper,
+            out,
+            ProotProcessLauncher(out, timeoutMs = GuestPackages.INSTALL_BOUND_MS),
+        )
         val finished = GuestStart(
             paths = paths,
             vfs = vfs,
             proot = proot,
-            packages = GuestPackages(paths, proot, NativeProot(helper, out), vfs),
+            guestInstall = ArtifactManifest.of(abi).guest,
+            packages = GuestPackages(paths, proot, installer, vfs),
             server = ProotForegroundServer(helper, out),
             binder = GuestWeb.LOOPBACK_BINDER,
             probe = GuestWeb.RetryingProbe(LoopbackWebProbe),

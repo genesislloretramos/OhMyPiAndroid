@@ -13,8 +13,10 @@ import omp.vm.provision.Artifact
 import omp.vm.provision.ArtifactManifest
 import omp.vm.provision.GuestOriginRecord
 import omp.vm.provision.GuestState
+import omp.vm.provision.InstallRecord
 import omp.vm.provision.GuestWeb
 import omp.vm.provision.ProvisionPaths
+import omp.vm.provision.ProvisionState
 import omp.vm.provision.ProvisionStatus
 import omp.vm.provision.ProvisionStatusHolder
 import omp.vm.provision.WebRoot
@@ -693,6 +695,7 @@ class Doctor(
         out.section(SECTION_ORIGIN)
         val state = paths.state(vfs)
         val record = readRecord(vfs, paths)
+        val install = omp.vm.provision.readInstallRecord(vfs, paths)
         val port = record?.port ?: guestPort
         val named = record?.stateName
         val known = record?.state
@@ -707,13 +710,73 @@ class Doctor(
                 ),
             )
         } else {
-            val effective = known
-                ?: if (state.rootfsInstalled) GuestState.NOT_STARTED else GuestState.NO_DEBIAN
+            val effective = when {
+                // A run of `apt` in progress outranks whatever the last completed start recorded:
+                // the record is written before the first step precisely so that a run this command
+                // cannot see is still a state rather than a silence.
+                install?.outcomeName == omp.vm.provision.GuestPackages.INSTALLING ->
+                    GuestState.LAMP_INSTALLING
+                known != null -> known
+                // Derived off the disk, not invented: a Debian and the real agent with no LAMP mark
+                // and no record of an install is a device that was provisioned and never brought
+                // past that, and that is the commonest of the answers to "why is the chat coming
+                // from the app instead of the Debian".
+                state.rootfsInstalled && state.agentInstalled && !state.guestInstalled ->
+                    GuestState.LAMP_MISSING
+                else -> if (state.rootfsInstalled) GuestState.NOT_STARTED else GuestState.NO_DEBIAN
+            }
             out.pair("state", "${effective.name}: ${effective.meaning(port)}")
         }
+        out.pair("packages", packagesLine(install, state))
         out.pair("port", originPortLine(record, port))
         out.pair("apache", originApacheLine(record, port))
         out.pair("agent", originAgentLine(record))
+    }
+
+    /**
+     * The guest's own LAMP: what was asked for, what the manifest estimated, and what `dpkg` says is
+     * really on the disk.
+     *
+     * **The real figure is beside the estimate and never instead of it.** A user agreed to 55 MB and
+     * 376.7 MiB at a moment when those were the only numbers this build had, and the honest thing
+     * afterwards is to say what it actually cost — which is [omp.vm.provision.InstallRecord]'s
+     * `measured-installed-kib`, read out of `dpkg`'s own status file inside the rootfs, on every ABI
+     * and with no network. The download share has no real figure at all: `apt` deletes the `.deb`
+     * files it fetched, so the line says the estimate is still an estimate rather than borrowing a
+     * number it cannot have.
+     *
+     * **A mark in the tree is a fact and a record is a fact, and both are printed.** The `guest state`
+     * section above says what is on the disk; this says what the last run of the install did, which
+     * is a different question and the one that answers "why is my guest not serving".
+     */
+    private fun packagesLine(install: InstallRecord?, state: ProvisionState): String {
+        if (state.guestInstalled) {
+            val measured = install?.measuredInstalledKib
+            return "installed: ${ProvisionPaths.GUEST_MARKER} is in ${paths.rootfsDir}" +
+                (if (measured == null) {
+                    ", and dpkg's own record is not readable, so the only figure is the manifest's " +
+                        "estimate"
+                } else {
+                    ", and dpkg reports " + ArtifactManifest.humanBytes(measured * 1024L) +
+                        " against the " + ArtifactManifest.humanBytes(
+                            (install.estimatedInstalledKib ?: 0L) * 1024L,
+                        ) + " the manifest estimated on arm64"
+                })
+        }
+        if (install == null) {
+            return "not installed: no ${ProvisionPaths.GUEST_MARKER} in ${paths.rootfsDir}, and no " +
+                "record of an install at ${omp.vm.provision.installRecordFile(paths)} — nothing has " +
+                "been fetched for them"
+        }
+        val name = install.outcomeName ?: "an outcome this build does not have"
+        val said = install.said?.let {
+            "; the run's own last line was \"$it\", and that line came from the dpkg on this device — " +
+                "no dpkg has ever been run by this build"
+        } ?: ""
+        val step = install.step?.let { " at `$it`" } ?: ""
+        return "not installed: the last run was $name$step, and ${ProvisionPaths.GUEST_MARKER} is " +
+            "not in ${paths.rootfsDir}$said. Whatever is half on the disk is not a web server this " +
+            "build will start, and the next start runs the sequence again with apt continuing"
     }
 
     /** The port, and what the run that checked it found. Never the port alone. */

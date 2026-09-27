@@ -173,9 +173,11 @@ class DoctorTest {
                 "  last run:      none: the update runs at every start of the app, and only when the Debian and its agent are both on this device",
                 "",
                 Doctor.SECTION_ORIGIN,
-                "  state:         NOT_STARTED: a Debian is on this device and this build has not started the guest, so the " +
-                    "chat the WebView was handed is this app's own loopback server; a guest that was only launched is " +
-                    "never shown as though it were answering",
+                "  state:         LAMP_MISSING: a Debian and the real agent are on this device and the guest's own LAMP is not, " +
+                    "so there is no apache2 inside it to start, and the chat the WebView was handed is this app's own " +
+                    "loopback server; the Debian's origin was refused rather than replaced by it",
+                "  packages:      not installed: no .omp-guest-packages in ${paths.rootfsDir}, and no " +
+                    "record of an install at ${omp.vm.provision.installRecordFile(paths)} — nothing has been fetched for them",
                 "  port:          ${omp.vm.provision.GuestWeb.RESERVED_PORT}, the port this build reserves for Apache inside the Debian, and nothing has tried to reserve it",
                 "  apache:        not asked: this build has not started the guest on this device, and this command starts nothing and asks nothing to find out",
                 "  agent:         not run: this build has not started the guest on this device, so there is no boot's 'omp update' from it to report; the 'agent update' section above is where any other run of it is read",

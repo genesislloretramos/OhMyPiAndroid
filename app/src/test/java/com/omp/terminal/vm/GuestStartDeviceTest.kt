@@ -1,5 +1,6 @@
 package com.omp.terminal.vm
 
+
 import omp.vm.guestapi.AgentUpdate
 import omp.vm.guestapi.UpdateRun
 import omp.vm.guestapi.UpdateTransport
@@ -143,6 +144,31 @@ class GuestStartDeviceTest {
         // The transport is a one-method seam and a fake of it is a whole `UpdateReport`, which is what
         // makes every branch of that class reachable on a JVM.
         assertEquals(1, UpdateTransport::class.java.methods.count { it.name == "run" })
+    }
+
+    // ---- the install's bound, and the never-run line ---------------------------------------------------------
+
+    @Test
+    fun theInstallIsGivenTheBoundTheStepItselfDeclares() {
+        // The number lives in `:core` because it is a fact about the step, and it is the *app* that
+        // can enforce it, because only `ProotProcessLauncher` can destroy a process. A boot that
+        // built its launcher with the default ten-minute wait would ignore a five-minute ceiling the
+        // step's own report and its `STOPPED` outcome are both written against.
+        assertEquals(300_000L, omp.vm.provision.GuestPackages.INSTALL_BOUND_MS)
+        // And it is a different number from the boot's other bounded step, on purpose: `omp update` is
+        // a check whose fast path is half a second, and this is 55 MB and 376.7 MiB of install.
+        assertTrue(
+            "the install is not a check and must not share the check's bound",
+            omp.vm.provision.GuestPackages.INSTALL_BOUND_MS != AgentUpdate.BOUND_MS,
+        )
+    }
+
+    @Test
+    fun aLauncherThatDestroyedTheInstallIsTheSame124TheUpdateUses() {
+        // One convention for "we stopped it" in this project, so a report never has to guess whether
+        // a 124 came from this app or from the guest.
+        assertEquals(omp.vm.guestapi.UpdateOutcome.TIMED_OUT.exitStatus, omp.vm.provision.GuestPackages.TIMED_OUT)
+        assertEquals(ProotProcessLauncher.TIMED_OUT, omp.vm.provision.GuestPackages.TIMED_OUT)
     }
 
     // ---- the marker the probe asks for -----------------------------------------------------------------------

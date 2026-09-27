@@ -287,8 +287,13 @@ class ArtifactManifest(
         /**
          * The LAMP closure for one ABI, or a null figure where it was not measured.
          *
-         * **Only arm64 was measured**, from the Debian trixie arm64 package index, and the other
-         * three rows carry null rather than a number borrowed from arm64. The sizes are
+         * **Only arm64 was measured**, and the measurement was taken on a build machine — resolving
+         * the arm64 trixie closure against the Debian package index there and adding up what `apt`
+         * reported it would fetch and unpack. **No `apt` has ever been run inside a guest by this
+         * build**, on any ABI, so these two numbers are a machine's reading of an index and not an
+         * observation of a Debian this app provisioned. The other three rows carry null rather than
+         * a number borrowed from arm64, and nothing has been measured for armhf, amd64 or i386 at
+         * all. The sizes are
          * architecture-dependent, and an amd64 `.deb` set against an arm64 figure is not a
          * rounding difference — it is the difference between a phone that installs and a phone
          * that runs out of room part way through. A null makes [describe] say that the figure is

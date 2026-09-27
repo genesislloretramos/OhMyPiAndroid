@@ -138,6 +138,18 @@ class ProvisionPaths(
     val guestMarker: String = "$rootfsDir/$GUEST_MARKER"
 
     /**
+     * `dpkg`'s own record of what is installed, read off the host side of the payload.
+     *
+     * **The one file inside the Debian this build can read after an install and learn something
+     * true from.** proot makes the rootfs an ordinary directory to everything outside it, so
+     * `/var/lib/dpkg/status` is readable through the [omp.shell.fs.Vfs] with no guest process and
+     * no network — and it is `dpkg` itself saying what it installed and how big, which is the only
+     * way to report a *real* figure for a step whose only other number is an estimate. See
+     * [omp.vm.provision.GuestPackages.measuredKib].
+     */
+    val dpkgStatus: String = "$rootfsDir/var/lib/dpkg/status"
+
+    /**
      * The directory inside the unpacked Debian that the guest's own PHP goes in.
      *
      * **`/usr/local/share/omp`, and not under the document root.** A file under

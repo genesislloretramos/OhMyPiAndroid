@@ -129,7 +129,17 @@ class GuestPackagesTest {
         assertTrue(text, text.contains("LAMP apache2-bin,libapache2-mod-php8.4,php8.4-cli,mariadb-server"))
         assertTrue(text, text.contains("57211704"))
         assertTrue(text, text.contains("385689"))
-        assertTrue(report.lines.any { it.contains("LAMP is installed in the Debian") })
+        // The cost line is now the measured figure beside the estimate, or the estimate beside the
+        // statement that dpkg could not be read — and on this fixture there is no
+        // `/var/lib/dpkg/status`, so the sentence says exactly that rather than quoting a number.
+        val cost = report.lines.first { it.startsWith("LAMP:") }
+        assertTrue(cost, cost.contains("dpkg's own record is not readable"))
+        assertTrue(cost, cost.contains("54.6 MiB (57,211,704 bytes) the manifest estimated"))
+        assertTrue(cost, cost.contains("still an estimate"))
+        // The mark now carries dpkg's own figure beside the manifest's, and on this fixture there is
+        // no `/var/lib/dpkg/status`, so the measured column says `unmeasured` rather than a number
+        // this build did not read.
+        assertTrue(text, text.contains("385689 unmeasured"))
     }
 
     @Test

@@ -75,7 +75,9 @@ class GuestStartTest {
         // `a2enconf` is launched as `/usr/sbin/a2enconf <name>`, so the last word is the snippet it was
         // asked to link in rather than the tool. Both are pinned where the vector is built, in
         // `GuestPackagesTest`; what this class cares about is that the step ran and in what order.
-        ran += argv.takeLast(2).joinToString(" ")
+        // The guest command, not proot's flags in front of it: the vector itself is asserted where it
+        // is built, in `ProotCommandTest`, and what this test is about is the order the steps ran in.
+        ran += argv.subList(argv.indexOfFirst { it.startsWith("/usr") }, argv.size).joinToString(" ")
         0
     }
 
@@ -175,19 +177,139 @@ class GuestStartTest {
     // ---- a guest that cannot be launched ----------------------------------------------------------------
 
     @Test
-    fun aDebianWithNoLampIsNotStartedAndSaysTheInstallIsNotAutomatic() {
+    fun aDebianWithNoLampRunsTheInstallBeforeApacheAndOnlyBeforeApache() {
+        // The placement, pinned by its order: the install is a precondition of Apache, because
+        // `apache2ctl` is a program in the Debian and without the packages there is nothing to run.
+        // It comes after the port check — 55 MB is not worth spending on a guest that is not going to
+        // serve this run — and before the boot's `omp update`, which is the one step a user waits on.
         provisionRootfs()
+        File(paths.agentDir).mkdirs()
+        File(paths.agentBinary).writeBytes(ByteArray(1_024))
+        serving = true
+        writeGuestConf()
+
+        start()
+
+        assertEquals(
+            listOf(
+                "/usr/bin/apt-get update",
+                "/usr/bin/apt-get install -y apache2-bin libapache2-mod-php8.4 php8.4-cli mariadb-server",
+                "/usr/sbin/a2enmod php8.4",
+                "/usr/sbin/a2enconf omp-guest",
+                "apache",
+                "omp update",
+            ),
+            ran,
+        )
+    }
+
+    @Test
+    fun aGuestThatAlreadyHasThePackagesPaysForTheInstallOnNoStartAtAll() {
+        // "Not on every app start" is the mark, and the mark is inside the tree: written only on a
+        // clean run, read on every start, and a second boot launches nothing here at all.
+        provisionGuest()
+        serving = true
+        start()
+        val afterTheFirstStart = ArrayList(ran)
+
+        ran.clear()
+        val second = start()
+
+        assertEquals("a boot after a boot must not spend 57 MB again", afterTheFirstStart, ran)
+        assertEquals(GuestState.UP, second.state)
+    }
+
+    @Test
+    fun aStoppedInstallIsItsOwnStateAndSaysTheNextOneContinues() {
+        // 124 is the launcher's own "we stopped it", the same status `omp update` reports as
+        // TIMED_OUT, and it is a different thing from a step that exited non-zero: apt has usually
+        // unpacked most of what it fetched by then, so the next start continues rather than starting.
+        provisionAgentOnly()
+        val stopped = installLauncher(FailAt.STOPPED)
+
+        val report = start(stopped)
+
+        assertEquals(GuestState.LAMP_FAILED, report.state)
+        assertFalse("a guest with no LAMP is not serving", report.serving)
+        assertTrue(report.lines.any { it.contains("was still running at") })
+        assertTrue(report.lines.any { it.contains("apt continues") })
+        // And Apache was never launched: there is no apache2ctl on the disk to launch.
+        assertFalse(ran.contains("apache"))
+    }
+
+    @Test
+    fun aFailedInstallIsReportedAsFailedAndNeverAsAGuestThatIsServing() {
+        // The rule the whole of this exists for, and the same one PORT_TAKEN follows: the honest end
+        // state is this app's own server, shown and named as this app's own server. What is on the
+        // disk after a step fails is a partial stack, and a partial stack is not a web server.
+        provisionAgentOnly()
+        val report = start(installLauncher(FailAt.STEP_TWO))
+
+        assertEquals(GuestState.LAMP_FAILED, report.state)
+        assertFalse(report.serving)
+        assertFalse(report.answered)
+        assertEquals("apache2 was not started", 0, ran.count { it == "apache" })
+        assertTrue(report.lines.any { it.contains("exited with status") })
+        assertTrue(report.lines.any { it.contains("a partial install") })
+    }
+
+    @Test
+    fun anInstallThatFailedIsRecordedSoTheDoctorCanNameTheStepAndTheGestsOwnLine() {
+        provisionAgentOnly()
+        start(installLauncher(FailAt.STEP_TWO))
+
+        val record = readInstallRecord(disk, paths)!!
+        assertEquals(GuestOutcome.FAILED.name, record.outcomeName)
+        assertEquals(
+            "the command is quoted whole so a report can name it",
+            "/usr/bin/apt-get install -y apache2-bin libapache2-mod-php8.4 php8.4-cli mariadb-server",
+            record.step,
+        )
+    }
+
+    @Test
+    fun aRunInProgressIsRecordedBeforeTheFirstStepSoAProcessThatDiesLeavesAState() {
+        // The record is written *before* apt runs, which is the only way "the packages are being
+        // installed" is an answer rather than a silence: the run this build cannot see — an app that
+        // was killed, a phone that rebooted — is the run a user most needs told about.
+        provisionAgentOnly()
+        val seen: ArrayList<String> = ArrayList()
+        val watching = ProotLauncher { _, _, _ ->
+            seen += (readInstallRecord(disk, paths)?.outcomeName ?: "nothing")
+            0
+        }
+        GuestStart(
+            paths, disk, proot,
+            GuestPackages(paths, proot, watching, disk),
+            guestInstall, server,
+            { true }, { serving }, updater(),
+        ).start()
+
+        assertTrue("the launcher ran at all", seen.isNotEmpty())
+        assertTrue("the record said INSTALLING on every step: $seen", seen.all { it == GuestPackages.INSTALLING })
+    }
+
+    @Test
+    fun aCleanInstallReportsWhatDpkgSaysNextToWhatTheManifestEstimated() {
+        // The real figure beside the estimate, on the line the boot prints and in the mark. The
+        // measured number is invented by the fixture's own `/var/lib/dpkg/status`, so the test is
+        // about the sentence pairing the two and not about a figure this build has.
+        provisionRootfs()
+        File(paths.agentDir).mkdirs()
+        File(paths.agentBinary).writeBytes(ByteArray(1_024))
+        File(paths.rootfsDir, ProvisionPaths.GUEST_MARKER) // ensure the dir exists
+        writeGuestConf()
+        writeDpkgStatus()
+        serving = true
 
         val report = start()
 
-        assertEquals(GuestState.APACHE_NOT_ANSWERING, report.state)
-        // Nothing was launched at all, and that is `GuestPackages.enableApi` being careful rather
-        // than lucky: with the drop-in absent, `a2enconf` would exit non-zero, and a failed step here
-        // would be a 57 MB `apt` being sent after it on the next start.
-        assertEquals(emptyList<String>(), ran)
-        assertFalse(report.serving)
-        assertTrue(report.lines.any { it.contains("is not in the Debian") })
-        assertTrue(report.lines.any { it.contains("'omp provision' prints the cost and asks") })
+        assertEquals(GuestState.UP, report.state)
+        val cost = report.lines.first { it.contains("measured by dpkg") }
+        assertTrue(cost, cost.contains("against the"))
+        assertTrue(cost, cost.contains("still an estimate"))
+        assertTrue(File(paths.guestMarker).readText().contains("700 unmeasured".replace(" unmeasured", "")) ||
+            File(paths.guestMarker).readText().contains("700"))
     }
 
     @Test
@@ -367,7 +489,7 @@ class GuestStartTest {
         serving = true
 
         val report = GuestStart(
-            paths, denied, proot, packages(), server,
+            paths, denied, proot, packages(), guestInstall, server,
             GuestWeb.PortBinder { true }, GuestWeb.WebProbe { true }, updater(), now = { 0L },
         ).start()
 
@@ -377,11 +499,39 @@ class GuestStartTest {
 
     // ---- helpers -----------------------------------------------------------------------------------------------
 
-    private fun start(): GuestStartReport = GuestStart(
+
+    private val guestInstall = ArtifactManifest.of(Abi.ARM64).guest
+
+    private fun packages(over: ProotLauncher = launcher) = GuestPackages(paths, proot, over, disk)
+
+    /** Which step, if any, of the install refuses, and how. */
+    private enum class FailAt { NONE, STOPPED, STEP_TWO }
+
+    private fun installLauncher(fail: FailAt): ProotLauncher {
+        var step = 0
+        return ProotLauncher { argv, _, _ ->
+            step++
+            ran += argv.subList(argv.indexOfFirst { it.startsWith("/usr") }, argv.size)
+                .joinToString(" ")
+            when {
+                fail == FailAt.STOPPED && step == 2 -> 124
+                fail == FailAt.STEP_TWO && step == 2 -> 100
+                else -> 0
+            }
+        }
+    }
+
+    /** `GuestStart` with every seam, so a caller can replace only the one it is about. */
+    private fun start(
+        install: ProotLauncher = launcher,
+        portFree: Boolean = this.portFree,
+        serving: Boolean = this.serving,
+    ): GuestStartReport = GuestStart(
         paths = paths,
         vfs = disk,
         proot = proot,
-        packages = packages(),
+        packages = packages(install),
+        guestInstall = guestInstall,
         server = server,
         binder = { port ->
             portsAsked += port
@@ -395,13 +545,38 @@ class GuestStartTest {
         now = { 1_789_000_000_000L },
     ).start()
 
-    private fun packages() = GuestPackages(paths, proot, launcher, disk)
-
     private fun updater() = AgentUpdate(paths, disk, proot, transport, now = { 1_789_000_000_000L })
 
     private fun provisionRootfs() {
         File(paths.rootfsDir).mkdirs()
         File(paths.rootfsDir, ProvisionPaths.ROOTFS_MARKER).writeText("omp-provisioned test\n")
+    }
+
+    /** A Debian and the real agent and nothing else: the state of a device provisioned today. */
+    private fun provisionAgentOnly() {
+        provisionRootfs()
+        File(paths.agentDir).mkdirs()
+        File(paths.agentBinary).writeBytes(ByteArray(1_024))
+    }
+
+    private fun writeGuestConf() {
+        File(paths.rootfsDir + paths.guestConf).parentFile!!.mkdirs()
+        File(paths.rootfsDir + paths.guestConf).writeText("# written by omp.vm.guestapi.GuestApiTree\n")
+    }
+
+    /**
+     * A `dpkg` status file naming the four packages this build asks for, with sizes invented here.
+     *
+     * A real stanza file, because the parser reads one and a stub of a parser would be a test that
+     * passes whatever the stub was told. The numbers are the fixture's own and are not Debian's.
+     */
+    private fun writeDpkgStatus() {
+        val stanzas = listOf("apache2-bin" to 500, "libapache2-mod-php8.4" to 120, "php8.4-cli" to 80)
+            .map { (name, kib) ->
+                "Package: $name\nStatus: install ok installed\nInstalled-Size: $kib\n"
+            } + "Package: mariadb-server\nStatus: deinstall ok config-files\nInstalled-Size: 900\n"
+        File(paths.dpkgStatus).parentFile!!.mkdirs()
+        File(paths.dpkgStatus).writeText(stanzas.joinToString("\n\n") + "\n\n")
     }
 
     /** A Debian with its agent and its own `apt` install, which is what a start needs to go further. */

@@ -6,6 +6,8 @@ import omp.shell.fs.RealVfs
 import omp.vm.guestapi.UpdateOutcome
 import omp.vm.provision.Abi
 import omp.vm.provision.GuestState
+import omp.vm.provision.GuestOutcome
+import omp.vm.provision.GuestPackages
 import omp.vm.provision.GuestStart
 import omp.vm.provision.GuestWeb
 import omp.vm.provision.ProvisionPaths
@@ -506,6 +508,163 @@ class GuestOriginSectionTest {
         )
     }
 
+
+    // ---- the guest's own LAMP, which is the commonest answer to "why is the chat from the app" -------
+
+    @Test
+    fun aDebianWithNoLampAndNoRecordSaysThePackagesAreNotInstalled() {
+        // The state a device provisioned today is in: a rootfs, an agent, and no `apache2-bin`.
+        provisionGuest()
+
+        val report = doctor().report()
+
+        assertEquals(
+            report.text(),
+            say(
+                "state",
+                "${GuestState.LAMP_MISSING.name}: a Debian and the real agent are on this device and " +
+                    "the guest's own LAMP is not, so there is no apache2 inside it to start, and the " +
+                    "chat the WebView was handed is this app's own loopback server; the Debian's " +
+                    "origin was refused rather than replaced by it",
+            ),
+            line(report, "state"),
+        )
+        assertEquals(
+            report.text(),
+            say(
+                "packages",
+                "not installed: no .omp-guest-packages in ${paths.rootfsDir}, and no record of an " +
+                    "install at ${omp.vm.provision.installRecordFile(paths)} — nothing has been " +
+                    "fetched for them",
+            ),
+            line(report, "packages"),
+        )
+        assertEquals(
+            report.text(),
+            say(
+                "origin",
+                "this app's own loopback server: this build has not started the guest on this " +
+                    "device, and a guest that was only launched is never shown as though it were " +
+                    "answering",
+            ),
+            chatLine(report, "origin"),
+        )
+    }
+
+    @Test
+    fun aRunOfAptThatIsGoingOnRightNowIsItsOwnStateAndSaysSo() {
+        // Read from the record the install writes *before* its first step, which is the only way the
+        // run this command cannot see is an answer rather than a silence.
+        provisionGuest()
+        writeInstallRecord(
+            GuestPackages.KEY_OUTCOME to GuestPackages.INSTALLING,
+            GuestPackages.KEY_SAID to "apt is running inside the Debian now",
+        )
+
+        val report = doctor().report()
+
+        assertEquals(
+            report.text(),
+            say(
+                "state",
+                "${GuestState.LAMP_INSTALLING.name}: an install of the guest's LAMP was running " +
+                    "inside the Debian when the app that started it stopped, so this start ran it " +
+                    "again and apt continued from what it had already unpacked; the chat the " +
+                    "WebView was handed is this app's own loopback server",
+            ),
+            line(report, "state"),
+        )
+        assertTrue(
+            report.text(),
+            line(report, "packages").contains("the last run was INSTALLING"),
+        )
+    }
+
+    @Test
+    fun aFailedInstallIsReportedWithTheCommandAndTheGestsOwnLastLine() {
+        provisionGuest()
+        writeInstallRecord(
+            GuestPackages.KEY_OUTCOME to GuestOutcome.FAILED.name,
+            GuestPackages.KEY_STEP to "/usr/bin/apt-get install -y apache2-bin libapache2-mod-php8.4 " +
+                "php8.4-cli mariadb-server",
+            GuestPackages.KEY_SAID to "E: Sub-process /usr/bin/dpkg returned an error code",
+        )
+        writeRecord(
+            GuestStart.KEY_STATE to GuestState.LAMP_FAILED.name,
+            GuestStart.KEY_PORT to "$port",
+            GuestStart.KEY_RESERVED to "yes",
+            GuestStart.KEY_LAUNCHED to "no",
+            GuestStart.KEY_ANSWERED to "no",
+        )
+
+        val report = doctor().report()
+
+        assertEquals(
+            report.text(),
+            say(
+                "state",
+                "${GuestState.LAMP_FAILED.name}: the guest's own LAMP did not finish installing, so " +
+                    "whatever is half on the disk is not a web server this build will start, and the " +
+                    "chat the WebView was handed is this app's own loopback server; the Debian's " +
+                    "origin was refused rather than replaced by it",
+            ),
+            line(report, "state"),
+        )
+        // Half an installed stack, named as half, with the reason quoted rather than paraphrased.
+        val packages = line(report, "packages")
+        assertTrue(packages, packages.contains("the last run was FAILED at"))
+        assertTrue(packages, packages.contains("returned an error code"))
+        assertTrue(packages, packages.contains("not a web server this build will start"))
+        // And it is not the origin: a device whose LAMP failed serves from the app, and says so.
+        assertTrue(chatLine(report, "origin").contains("this app's own loopback server"))
+    }
+
+    @Test
+    fun anInstallStoppedAtTheBoundIsReportedAsStoppedAndNotAsFailed() {
+        provisionGuest()
+        writeInstallRecord(
+            GuestPackages.KEY_OUTCOME to GuestOutcome.STOPPED.name,
+            GuestPackages.KEY_STEP to "/usr/bin/apt-get install -y apache2-bin",
+        )
+        writeRecord(
+            GuestStart.KEY_STATE to GuestState.LAMP_FAILED.name,
+            GuestStart.KEY_ANSWERED to "no",
+        )
+
+        val report = doctor().report()
+
+        // The two are told apart by the name and not by the number, exactly as
+        // `omp.vm.guestapi.UpdateOutcome` tells TIMED_OUT apart from FAILED.
+        assertTrue(line(report, "packages").contains("the last run was STOPPED"))
+    }
+
+    @Test
+    fun anInstalledStackReportsWhatDpkgSaysNextToWhatTheManifestEstimated() {
+        provisionGuest()
+        File(paths.rootfsDir, ProvisionPaths.GUEST_MARKER).writeText("#omp-guest/v1\n")
+        writeInstallRecord(
+            GuestPackages.KEY_OUTCOME to GuestOutcome.INSTALLED.name,
+            GuestPackages.KEY_ESTIMATED_DOWNLOAD to "57121704",
+            GuestPackages.KEY_ESTIMATED_INSTALLED to "385689",
+            GuestPackages.KEY_MEASURED_INSTALLED to "412880",
+        )
+
+        val report = doctor().report()
+
+        // The real figure beside the estimate, on every ABI, read out of dpkg's own status file with
+        // no guest process and no network.
+        assertEquals(
+            report.text(),
+            say(
+                "packages",
+                "installed: .omp-guest-packages is in ${paths.rootfsDir}, and dpkg reports " +
+                    "403.2 MiB (422,789,120 bytes) against the 376.6 MiB (394,945,536 bytes) the " +
+                    "manifest estimated on arm64",
+            ),
+            line(report, "packages"),
+        )
+    }
+
     // ---- helpers ---------------------------------------------------------------------------------------------
 
     private fun doctor() = Doctor(services, RealVfs(), paths, probe = Doctor.Probe { false })
@@ -559,6 +718,16 @@ class GuestOriginSectionTest {
     private fun publishUrl() {
         File(files, "web").mkdirs()
         File(files, "web/url").writeText("http://127.0.0.1:8731/login?t=a-32-character-test-token\n")
+    }
+
+    private fun writeInstallRecord(vararg lines: Pair<String, String>) {
+        File(paths.downloadDir).mkdirs()
+        File(omp.vm.provision.installRecordFile(paths)).writeText(
+            buildString {
+                append(GuestPackages.RECORD_HEADER).append('\n')
+                for ((key, value) in lines) append(key).append(' ').append(value).append('\n')
+            },
+        )
     }
 
     private fun writeRecord(vararg lines: Pair<String, String>) {

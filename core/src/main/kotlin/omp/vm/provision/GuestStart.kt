@@ -39,6 +39,39 @@ enum class GuestState(val serving: Boolean) {
     /** There is no unpacked Debian on this device, so nothing was launched and nothing could be. */
     NO_DEBIAN(false),
 
+    /**
+     * The Debian is here and the real agent is here, and the guest's own LAMP is not, and no
+     * install of it has been attempted in this run.
+     *
+     * **A state of its own and not a flavour of "the guest is not up", because it is the single most
+     * common answer to "why is the chat coming from the app instead of the Debian"** on a device
+     * that was provisioned today: the rootfs unpacked, the agent unpacked, and `apache2-bin`,
+     * `libapache2-mod-php8.4`, `php8.4-cli` and `mariadb-server` were never installed because nothing
+     * called [omp.vm.provision.GuestPackages.install]. [serving] is false because there is no
+     * `apache2ctl` on the disk to start, and the WebView is handed this app's own server and told so.
+     */
+    LAMP_MISSING(false),
+
+    /**
+     * The record says an install of the guest's LAMP was running when the app that wrote it stopped.
+     *
+     * **A state rather than a claim that anything is wrong.** A run that was killed part way, a
+     * phone that rebooted, a process the system reclaimed: the record is written *before* the first
+     * step precisely so this state exists, and what it means to a reader is that the next start will
+     * run the sequence again and `apt` will continue from what it already unpacked.
+     */
+    LAMP_INSTALLING(false),
+
+    /**
+     * The install ran and did not finish: a step exited non-zero, or it was stopped at
+     * [omp.vm.provision.GuestPackages.INSTALL_BOUND_MS].
+     *
+     * **The mark is not in the tree, which is the whole of what "not installed" means here** — and so
+     * a half-unpacked stack, which is the ordinary outcome of a phone radio dropping a 55 MB
+     * transfer, is reported here and is never presented as a guest that can serve anything.
+     */
+    LAMP_FAILED(false),
+
     /** A Debian is on the device and this build did not start it. [GuestStartReport.lines] says which of the reasons. */
     NOT_STARTED(false),
 
@@ -82,6 +115,18 @@ enum class GuestState(val serving: Boolean) {
             "something on this phone already holds ${GuestWeb.baseUrl(port)}, so Apache was not " +
                 "started at all, and the Debian's origin was refused rather than replaced by this " +
                 "app's own server"
+        LAMP_MISSING ->
+            "a Debian and the real agent are on this device and the guest's own LAMP is not, so " +
+                "there is no apache2 inside it to start, and the chat the WebView was handed is this " +
+                "app's own loopback server; the Debian's origin was refused rather than replaced by it"
+        LAMP_INSTALLING ->
+            "an install of the guest's LAMP was running inside the Debian when the app that started " +
+                "it stopped, so this start ran it again and apt continued from what it had already " +
+                "unpacked; the chat the WebView was handed is this app's own loopback server"
+        LAMP_FAILED ->
+            "the guest's own LAMP did not finish installing, so whatever is half on the disk is not " +
+                "a web server this build will start, and the chat the WebView was handed is this " +
+                "app's own loopback server; the Debian's origin was refused rather than replaced by it"
         APACHE_NOT_ANSWERING ->
             "the guest was started and nothing answered a request for this build's chat page on " +
                 "${GuestWeb.baseUrl(port)}, so the Debian's origin was refused rather than replaced " +
@@ -234,6 +279,17 @@ class GuestStart(
     /** The guest's own `a2enconf`, and the only step here that runs a command to completion. */
     private val packages: GuestPackages,
 
+    /**
+     * The manifest's own description of what the guest installs for itself, from
+     * [omp.vm.provision.ArtifactManifest.of] for this device's ABI.
+     *
+     * A constructor parameter and not something computed in here for the same reason
+     * [omp.vm.provision.ArtifactManifest] is handed in everywhere else: the cost a user agreed to
+     * and the cost a run actually incurred are the same numbers, and this class must not be the one
+     * that rounds them.
+     */
+    private val guestInstall: GuestInstall,
+
     /** The device half: start the server and leave it running. */
     private val server: GuestServer,
 
@@ -279,23 +335,43 @@ class GuestStart(
         lines += "reserved ${GuestWeb.baseUrl(port)}: it was free, and it has been given back so " +
             "Apache can take it."
 
+        // **The LAMP install goes here, before Apache and after the port, and the order is the
+        // argument rather than the order it happens to be written in.** Apache is a program in the
+        // Debian: without `apache2-bin` there is no `/usr/sbin/apache2ctl` to run, so the install is
+        // not one step among several but a precondition of the one that follows. It goes *after* the
+        // port check because 55 MB over a phone radio is a cost worth not paying for a guest that is
+        // not going to serve this run anyway, and it goes *before* the boot's `omp update` because
+        // the update is the one bounded step a user waits on and the page is worth more than the
+        // agent's version.
+        //
+        // **And it does not run on every app start**, which is the other half of the decision: the
+        // mark is inside the tree, written only on a clean run, and [GuestPackages.install] returns
+        // without launching a single thing when it is there. A device with LAMP installed pays
+        // nothing here and the rest of the sequence proceeds exactly as before.
+        val install = packages.install(guestInstall)
+        lines += install.lines
+        when (install.outcome) {
+            GuestOutcome.INSTALLED, GuestOutcome.ALREADY_INSTALLED -> Unit
+            GuestOutcome.STOPPED -> return report(
+                GuestState.LAMP_FAILED,
+                lines,
+                reserved = true,
+                launched = false,
+                said = install.lines.lastOrNull(),
+            )
+            GuestOutcome.FAILED -> return report(
+                GuestState.LAMP_FAILED,
+                lines,
+                reserved = true,
+                launched = false,
+                said = install.lines.lastOrNull(),
+            )
+        }
+
         // The API configuration, before the server that reads it. One command, no download, and not
         // gated on the agent.
         val api = packages.enableApi()
         lines += api.lines
-        if (!state.guestInstalled) {
-            lines += "the guest's own ${api.guest.name} is not in the Debian, so there is no apache2 " +
-                "to start: ${ProvisionPaths.GUEST_MARKER} is not in ${paths.rootfsDir}. Nothing was " +
-                "launched, and this build does not install it at start-up — 'omp provision' prints " +
-                "the cost and asks before a byte moves."
-            return report(
-                GuestState.APACHE_NOT_ANSWERING,
-                lines,
-                reserved = true,
-                launched = false,
-                said = api.lines.lastOrNull(),
-            )
-        }
 
         val launch = server.start(proot.argv(GuestWeb.APACHE_COMMAND), proot.env(), proot.workDir)
         launch.said?.let { lines += "the guest's Apache: $it" }
