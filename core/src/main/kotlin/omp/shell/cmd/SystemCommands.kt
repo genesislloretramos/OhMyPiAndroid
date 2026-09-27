@@ -3,6 +3,7 @@ package omp.shell.cmd
 import omp.shell.exec.CommandTable
 import omp.vm.VmCommand
 import omp.vm.launcher.OmpCommand
+import omp.vm.doctor.DoctorCommand
 
 /**
  * Commands that report on the device itself. They reach the platform only through
@@ -21,5 +22,9 @@ object SystemCommands {
         // session's own Vfs where the container is, so the same object manages Documents/omp here
         // and /mnt/omp in there, and the VM inherits it with the copy.
         table.register(OmpCommand())
+        // The diagnostic, next to the two things it reports on. It is here for the same reason
+        // `vm` is: a user holding a phone needs it in the shell, on the phone's own filesystem,
+        // and a doctor that lived only in `:app` would make every JVM test of it a lie.
+        table.register(DoctorCommand)
     }
 }
