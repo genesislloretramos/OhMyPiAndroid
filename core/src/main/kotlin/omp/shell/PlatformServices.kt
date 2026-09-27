@@ -29,6 +29,23 @@ interface PlatformServices {
     fun externalStorageDir(): String?
 
     /**
+     * The app's native library directory — the one the package manager extracts this app's own
+     * `.so` files into, which is why `android:extractNativeLibs` exists — or null when the platform
+     * has not told us.
+     *
+     * It is here for one caller: [omp.vm.provision], which has to know where a **native helper** is
+     * allowed to live. A downloaded Debian and a downloaded agent do not need it; proot does,
+     * because the kernel is the thing that has to exec *something*, and since Android 10 that
+     * something may not be a file in the app's own storage. Putting a directory in the shell's
+     * platform seam for that one fact is a smaller change than a second seam nobody shares.
+     *
+     * Null by default, deliberately: a platform that has not answered is not the same as a
+     * platform with no such directory, and the code that asks has to say which one it is looking
+     * at rather than guess. The Android implementation overrides it.
+     */
+    fun nativeLibraryDir(): String? = null
+
+    /**
      * True when the app holds "All files access". Re-read at every call: the user can revoke the
      * grant from system settings at any moment, so a cached answer goes stale silently.
      */

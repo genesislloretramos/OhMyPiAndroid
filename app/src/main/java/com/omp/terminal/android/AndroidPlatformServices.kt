@@ -112,6 +112,21 @@ class AndroidPlatformServices(
         return Environment.getExternalStorageDirectory().absolutePath
     }
 
+    /**
+     * Where the package manager put this APK's `lib/<abi>/` files, which is the only directory
+     * Android still lets this app's uid `execve` from: since Android 10, `execute_no_trans` on an
+     * `app_data_file` is denied to any app with `targetSdkVersion >= 29`, and
+     * `/data/app/~~<hash>/<pkg>-<hash>/lib/<abi>` carries `apk_data_file` instead, on which the app
+     * domain holds `rx_file_perms`.
+     *
+     * Read from `applicationInfo` rather than from `Build.SUPPORTED_ABIS` and a computed path: the
+     * directory is chosen by the package manager, per install, and it exists only because
+     * `android:extractNativeLibs="true"` made it copy the entries out at install time. The
+     * interface leaves this nullable precisely so that an app which packaged no native library can
+     * say so; see [com.omp.terminal.vm.ProotHelper], which is the one caller.
+     */
+    override fun nativeLibraryDir(): String? = app.applicationInfo.nativeLibraryDir
+
     /** Re-read on every call: the user can revoke the grant from system settings at any moment. */
     override fun isExternalStorageManager(): Boolean =
         if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager() else false

@@ -304,13 +304,194 @@ afternoon to them:
   stair-steps to the right.
 - `java.lang.ProcessHandle` does not exist on Android.
 
+## The native helper
+
+Running a real Debian means running a real `proot`: a glibc binary cannot `exec` on Android's
+bionic kernel, and since Android 10 the only place Android lets an app's own uid `exec` a file is
+the directory the package manager extracts the APK's `lib/<abi>/` entries into. So this APK ships
+**eighteen files, 1,130,556 bytes**, under `app/src/main/jniLibs/` — five names for each of the two
+64-bit ABIs and four for each of the two 32-bit ones — committed like source. No build step
+fetches a binary, because a build that fetches a binary is a build nobody can reproduce.
+
+**This is the whole of the native code in the app.** The shell, the namespace VM, the agent, the
+loopback server and the chat are Kotlin; `proot` and the three libraries it links are the only
+third-party binaries, they are here because a real Linux userland cannot be reimplemented, and
+they are **GPL** — not a vendored fork of this project, but a package from Termux's repository,
+reproduced byte-for-byte. The licences, the versions, the index checksums and the source offer are
+below, and nothing under `jniLibs` is a project-owned work.
+
+| shipped as | what it is | why that name |
+|---|---|---|
+| `libproot.so` | `proot` 5.1.107.95 | the kernel execs it |
+| `libproot-loader.so` | proot's ptrace-time loader, statically linked | the kernel execs it too: proot substitutes the loader's path for the guest program's in the `execve` (`src/execve/enter.c`) |
+| `libproot-loader32.so` | the 32-bit loader, 64-bit ABIs only | as above, for a 32-bit guest; this app never has one |
+| `libtalloc.so` | `libtalloc` 2.4.3 (`libtalloc.so.2.4.3`) | see below |
+| `libandroid-shmem.so` | `libandroid-shmem` 0.7 | as upstream |
+
+**Every name is `lib*.so` and that is not a style choice.** AOSP's extractor keeps a `lib/<abi>/`
+entry only if its name starts with `lib` and ends with `.so` — in a non-debuggable build, with no
+exception — and silently skips anything else. `proot` would never be extracted, and the directory
+is only ever populated at install time, so nothing would put it back. `libtalloc.so.2` is the
+name in proot's `DT_NEEDED` and the name no package manager will extract, which is why it ships as
+`libtalloc.so` and is copied at first run to `filesDir/omp/proot-libs/libtalloc.so.2`, which is
+what `LD_LIBRARY_PATH` then names. The copy is safe where the original is not because Android 10
+denied `execve` from app storage and deliberately left `mmap(PROT_EXEC)` working.
+
+**Nothing here has ever been run, anywhere, and proot itself has never been executed in this
+environment at all** — no device, no emulator, no ARM Android. Not in a test either: a helper
+present in an APK is not a helper that has run. The bytes are verified against the
+Termux `.deb` payloads and the layout is verified, and whether the kernel will `exec` any of it,
+whether the linker resolves what `LD_LIBRARY_PATH` says, and whether the OEM's SELinux policy
+permits `ptrace` are all open. `omp doctor`'s closing line says so on the device, and
+`docs/vm.md` says what a green report still cannot tell you.
+
 ## Layout
 
 ```
-core/   the shell. Plain JVM, no android.* imports, so all of it runs under :core:test.
-app/    the Activity, the view that draws the screen, and the platform commands.
+core/   the shell, the agent, the namespace VM, the provisioning layer, the guest start, the
+        diagnostic and the guest API. Plain JVM, no android.* imports, so all of it runs under
+        :core:test.
+app/    the Activity, the view that draws the screen, the platform commands, the chat host and the
+        WebView.
+        app/.../web/ is the HTTP server, the chat API, the token gate and the origin chooser, and
+        has no android.* in it either, which is what lets :app:testDebugUnitTest drive it over a
+        real socket with no emulator.
+        app/.../vm/ is the same: the ProotHelper, the launcher and the guest boot composition are
+        plain JVM, so the names, the environment and the argument vector can be asserted without a
+        phone.
+        app/src/main/assets/web/ is the chat itself — index.html, app.css, app.js, three files and
+        no build step. The app serves them and `omp provision` writes the same bytes into the
+        guest's document root, so there is one copy of the UI in the project.
+        app/src/main/jniLibs/ is the native helper above, per ABI, as committed bytes.
 ```
 
 ## License
 
 Do what you want with it.
+
+### The native helper is GPL, and here is the whole of it
+
+This app's own code is the "do what you want with it" above. The eighteen native files in `jniLibs`
+are not, and the difference is not a formality: `proot` is GPL, which means a redistributor of the
+binary in a public repository has to account for the source of *that* binary, not just of this app.
+
+**`proot` 5.1.107.95 — GNU General Public License, version 2 or (at your option) any later
+version.** The project states it in SPDX form in its own README, at
+<https://github.com/proot-me/proot/blob/master/README.rst> (`SPDX-License-Identifier:
+GPL-2.0-or-later`), and the licence file that names is
+<https://github.com/proot-me/proot/blob/master/COPYING>, which is the GPL version 2 text. The
+exact version vendored says the same in every source header, `src/cli/proot.c` among them:
+*"modify it under the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 2 of the License, or (at your option) any later version."* That
+`COPYING` also carries the copyright: *"The copyright holder for PRoot and CARE is
+STMicroelectronics"*, with Cédric VINCENT as original author and maintainer, and the headers
+carrying `Copyright (C) 2015 STMicroelectronics`. The project page, <https://proot-me.github.io/>,
+describes what proot does and names no licence, which is why the repository and the licence file
+are cited rather than the page.
+
+**`libtalloc` 2.4.3 — GNU Lesser General Public License, version 3 or (at your option) any later
+version.** Established from the library's own source, downloaded and checksummed from
+<https://www.samba.org/ftp/talloc/talloc-2.4.3.tar.gz>: `talloc.c` carries the header *"This
+library is free software; you can redistribute it and/or modify it under the terms of the GNU
+Lesser General Public License as published by the Free Software Foundation; either version 3 of
+the License, or (at your option) any later version"*, and `LICENSE` in the same tarball is the
+LGPL-3.0 text, *"GNU LESSER GENERAL PUBLIC LICENSE, Version 3, 29 June 2007"*. Termux's package
+recipe declares `TERMUX_PKG_LICENSE="GPL-3.0"` for this package and the `.deb` ships a
+`copyright` symlink pointing at Termux's own `LICENSES/GPL-3.0.txt`; that is the packager's
+metadata, not the library's licence, and the upstream source is what the licence attaches to. The
+one judgement in this section, and the one worth a second opinion if someone disagrees.
+
+**`libandroid-shmem` 0.7 — BSD 3-Clause.** From the project's own licence file at
+<https://github.com/termux/libandroid-shmem/blob/v0.7/LICENSE>, and the same text ships in the
+`.deb` as `share/doc/libandroid-shmem/copyright`: *"Copyright (c) 2013, Sergii Pylypenko /
+Copyright (c) 2017, Fredrik Fornwall / All rights reserved."* Its binary-redistribution clause —
+*"Redistributions in binary form must reproduce the above copyright notice, this list of
+conditions and the following disclaimer in the documentation or other materials provided with the
+distribution"* — is why that notice is reproduced here and not left in a file inside the package.
+
+### Where they came from
+
+The [Termux repository](https://packages.termux.dev/apt/termux-main/), which is where a prebuilt
+bionic-linked proot exists for all four Android ABIs. `proot` 5.1.107.95 declares
+`Depends: libandroid-shmem, libtalloc`; both dependencies are in the APK as well and are accounted
+for above. These are the `SHA256` values from the repository index at
+`https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-<abi>/Packages.gz`, and every
+byte in `jniLibs` is byte-identical to the payload of the `.deb` these identify:
+
+| ABI | package | version | `.deb` SHA256 |
+|---|---|---|---|
+| `aarch64` | proot | 5.1.107.95 | `0a1b3d0f6ef76436c5ed924cd8e8f5a6b7186e99e1650eb2d9bc734e218a74cb` |
+| `arm` | proot | 5.1.107.95 | `111a29219568b0e3c72f6bd5383f1bebb86f2e5f38ee260b95c4254c9267049d` |
+| `x86_64` | proot | 5.1.107.95 | `f63ce9bd0d38715eae0163a3772f3395913587444c7ce7232091c6d359afe3c3` |
+| `i686` | proot | 5.1.107.95 | `c0d44ecaba83300280d1d487a1e9c69c509750db1d7961b6f79d27c916d68970` |
+| `aarch64` | libtalloc | 2.4.3 | `ac81ad623d74c209718b9f3acb2dd702cc8a88c431e820d212229910b4db29da` |
+| `arm` | libtalloc | 2.4.3 | `cd56f87007e487c8025fac2df2a27b2bc58102344040a527eaa6fa7527d18f9b` |
+| `x86_64` | libtalloc | 2.4.3 | `7ca2eaae2e53b28228a01301bc410b62845403d6317c25b8e0a7f40681de0628` |
+| `i686` | libtalloc | 2.4.3 | `7b79f8b5e41d597940551ef9bd5a2fef7978f519300af8fc5c498d34a93f575a` |
+| `aarch64` | libandroid-shmem | 0.7 | `0da3a24d558b93c92bcf8d611e0826a99ff96e396b148e6cdf33b47c47c57ff6` |
+| `arm` | libandroid-shmem | 0.7 | `5832fd11dca9be2a288dd8fbc2b2799b289c812c7a8764f1f8234c425aa64ce5` |
+| `x86_64` | libandroid-shmem | 0.7 | `ffa9e4c87467b158b148d0ff92dda796aa038276c2075af3269cdcdb06f25797` |
+| `i686` | libandroid-shmem | 0.7 | `e9ccecee1aeed7dd70ac93bf44a6ba1bf6d4cb9559aabeb086acdc89accb4ba4` |
+
+### The source, and what GPL-2.0 §3 actually obliges a redistributor to do
+
+GPL-2.0 §3 governs distributing this in object or executable form, and offers three ways to comply.
+Quote, from the licence text:
+
+> 3. You may copy and distribute the Program (or a work based on it, under Section 2) in object
+> code or executable form under the terms of Sections 1 and 2 above provided that you also do one of
+> the following:
+>
+> a) Accompany it with the complete corresponding machine-readable source code […]
+> b) Accompany it with a written offer, valid for at least three years, to give any third party […]
+> c) Accompany it with the information you received as to the offer to distribute corresponding
+> source code. […]
+>
+> If distribution of executable or object code is made by offering access to copy from a designated
+> place, then offering equivalent access to copy the source code from the same place counts as
+> distribution of the source code, even though third parties are not compelled to copy the source
+> along with the object code.
+
+Plus §1: give every recipient *"a copy of this License along with the Program"*, and keep the
+copyright notices intact. This repository does **both** by pointing at the exact source rather than
+writing a letter: this project's public repository is the "designated place", and the complete
+corresponding source of the exact binary in `jniLibs` is these two published, checksummed
+artifacts — the upstream tree the binary was built from, and the recipe that contains every patch
+and flag Termux compiled it with. A built binary with no stated source tree is not a
+corresponding source; a source tree plus the build script that produced these exact bytes is.
+
+| what | where | SHA256 |
+|---|---|---|
+| `proot` 5.1.107.95 source, as Termux builds it | <https://github.com/termux/proot/archive/v5.1.107.95.zip> | `dbb50381c2f0b5c342bdf3d3467d80c21d2a4677d9dadd14159fa3b32f11b319` |
+| the recipe that builds the binary in this APK | <https://github.com/termux/termux-packages/blob/master/packages/proot/build.sh> | — |
+| `libtalloc` 2.4.3 source | <https://www.samba.org/ftp/talloc/talloc-2.4.3.tar.gz> | `dc46c40b9f46bb34dd97fe41f548b0e8b247b77a918576733c528e83abd854dd` |
+| `libandroid-shmem` 0.7 source | <https://github.com/termux/libandroid-shmem/archive/refs/tags/v0.7.tar.gz> | `1e5ff8459bc0a8c229dd8a94b27d119987e09ef3414331c2b5ebfff20b98e867` |
+
+All four were downloaded and had their SHA256 checked against the recipe before any of it was
+copied, and the payloads in `jniLibs` were compared byte-for-byte against the `.deb`s those index
+checksums identify. The build recipe is the part that makes this a source offer rather than a
+source *pointer*: `PROOT_UNBUNDLE_LOADER`, `-DVERSION`, `-DARG_MAX` and
+`-C src PROOT_WITH_LIBANDROID_SHMEM=true` are all in it, and all four are visible in the binary that
+is in this repository — the `PROOT_UNBUNDLE_LOADER` path and the `PROOT_LOADER` variable in its
+strings, and the bionic NDK build tags in its ELF notes.
+
+The LGPL-3.0 obligation on `libtalloc` is the smaller one and it is met by the same table: LGPL-3.0
+§4–§5 ask for a verbatim copy of the licence and for the library's own source to be conveyed, and
+§6 asks that the recipient be able to relink the application against a modified library. Nothing
+here links talloc into an application, so nothing here forecloses that; the source is the upstream
+tarball above and the licence text is at <https://www.gnu.org/licenses/lgpl-3.0.html>.
+
+The BSD-3-Clause obligation on `libandroid-shmem` asks for the notice and the disclaimer to travel
+with the binary, and the notice is quoted in full above. GPL-2.0 §1's "keep intact all the notices
+that refer to this License" is why the `proot` attribution above names STMicroelectronics and Cédric
+VINCENT rather than only naming the licence.
+
+**One gap, stated rather than hidden.** §1 asks for "a copy of this License along with the
+Program", and the three licence texts are linked here rather than vendored into this repository:
+GPL-2.0 at <https://www.gnu.org/licenses/old-licenses/gpl-2.0.html>, LGPL-3.0 at
+<https://www.gnu.org/licenses/lgpl-3.0.html>, and the BSD-3-Clause notice quoted in full above.
+Each is also inside the corresponding source archive the table above names, so a recipient who
+downloads the source the GPL obliges them to be given has the licence text in hand as well. If
+that link-and-name arrangement is not good enough for whoever publishes this, the fix is two
+files — `COPYING.gpl-2.0` and `COPYING.lgpl-3.0`, both verbatim copies available from the URLs
+above — and nothing else about the attribution would change.
