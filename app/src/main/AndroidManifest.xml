@@ -10,6 +10,13 @@
     <!-- am force-stop -->
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
 
+    <!-- The chat server: a foreground service that holds a loopback socket open. FOREGROUND_SERVICE
+         alone, because the type is specialUse and not dataSync — see the <service> below. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Without this the notification a foreground service is required to show is not shown on
+         API 33+, which would leave the user with a service they cannot see and cannot stop. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!--
       extractNativeLibs is what puts proot on the device at all. The APK carries a native helper
       under `lib/<abi>/` for every ABI this app claims, and the package manager copies those entries
@@ -51,5 +58,29 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          The host. Not exported: nothing outside this app has any business starting it, and the
+          only door into it is a browser on this device, which reaches it over loopback with the
+          install's own token. The Activity is what starts it; the notification's Stop action is
+          what ends it.
+
+          The type is specialUse and not dataSync, and the reason is the cap: Android 14 allows a
+          dataSync foreground service about six hours in a rolling day and then stops it, which for
+          a server that is meant to be up whenever the app is open would be a feature that is off
+          for most of every day. specialUse has no such cap. It is also the type a store review
+          asks you to justify — which is a cost this app does not pay, because it is sideloaded and
+          has never been on a store. The subtype below is the justification, in the plainest terms
+          available, because a reader in six months will otherwise "tidy" this back to dataSync and
+          break the thing.
+        -->
+        <service
+            android:name=".ChatService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="A local HTTP server bound to this device's loopback interface, serving this app's own chat UI to a browser on this phone" />
+        </service>
     </application>
 </manifest>

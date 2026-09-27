@@ -14,6 +14,22 @@
             android:layout_height="0dp"
             android:layout_weight="1" />
 
+        <!--
+          The chat, from whichever origin is serving it: Apache inside the Debian once there is
+          one, and this app's own loopback server until then. It sits beside the terminal in the
+          same column and exactly one of the two is visible, because a phone showing both at once
+          is a phone showing two things that both want Back.
+
+          Gone rather than invisible: a WebView that is not on screen still runs its timers unless
+          the Activity pauses it, and ChatView.onPause is driven by the Activity's own lifecycle.
+        -->
+        <com.omp.terminal.ChatView
+            android:id="@+id/chatView"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:visibility="gone" />
+
         <com.omp.terminal.ExtraKeysView
             android:id="@+id/extraKeys"
             android:layout_width="match_parent"

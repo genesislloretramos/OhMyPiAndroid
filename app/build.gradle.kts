@@ -58,4 +58,10 @@ kotlin {
 
 dependencies {
     implementation(project(":core"))
+
+    // The HTTP layer is written to be driven over a real loopback socket on the JVM, which is what
+    // `LocalServerTest` does. It needs the same JUnit `:core` uses and nothing else — no
+    // Robolectric, no AndroidX, and nothing that would let a test reach an `android.*` class and
+    // pass by accident.
+    testImplementation(libs.junit)
 }

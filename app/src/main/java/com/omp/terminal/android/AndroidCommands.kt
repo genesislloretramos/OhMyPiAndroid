@@ -27,6 +27,7 @@ object AndroidCommands {
             Hostname,
             Ip,
             Ifconfig,
+            WebCommand,
         )
         // The alias resolves against the table, so `dumpsys` has to be in it already.
         BatteryAlias.register(table)

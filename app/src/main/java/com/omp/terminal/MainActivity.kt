@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.text.Editable
 import android.text.TextWatcher
+import android.util.Log
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowInsets
@@ -19,11 +20,15 @@ import android.widget.EditText
 import android.widget.Toast
 import com.omp.terminal.android.AndroidCommands
 import com.omp.terminal.android.AndroidPlatformServices
+import com.omp.terminal.vm.GuestRuntime
+import com.omp.terminal.web.GuestOrigin
+import com.omp.terminal.web.UiOrigins
 import omp.shell.InputChannel
 import omp.shell.Session
 import omp.shell.SessionHost
 import omp.shell.ShellSession
 import omp.term.Screen
+import java.io.OutputStream
 
 /**
  * The single Activity. It owns the shell thread and the session; the terminal view only ever reads
@@ -61,6 +66,7 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
     private lateinit var input: InputChannel
     private lateinit var shell: ShellSession
     private lateinit var terminal: TerminalView
+    private lateinit var chat: ChatView
     private lateinit var extraKeys: ExtraKeysView
     private lateinit var imeInput: EditText
     private lateinit var services: AndroidPlatformServices
@@ -70,11 +76,29 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
     private var armed = Modifier.NONE
     private var backPressedAt = 0L
 
+    /**
+     * Whether the chat's origin has been decided for this Activity.
+     *
+     * **A plain `Boolean` on the main thread and not a nullable field, because "not decided" and
+     * "decided to be nothing" are different answers** and the second one is reached by setting this
+     * before the null check. The frame loop is the only writer besides [decideUiOrigin] itself, and
+     * it is on the same thread as both.
+     */
+    private var originDecided = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         services = AndroidPlatformServices(applicationContext, this)
         AndroidCommands.register(omp.shell.exec.CommandTable.global)
+
+        // The host is started here and is not tied to this Activity's life. The terminal below is
+        // unchanged either way: closing the window leaves the server running, which is the point
+        // of it being a foreground service, and stopping it from the notification takes the port
+        // back without touching the shell. `start` is idempotent, so a rotation asks for nothing
+        // that is not already running.
+        ChatService.start(this)
+        askForNotificationPermission()
 
         val cellHeight = services.prefInt(PREF_CELL_HEIGHT, 0)
         val scrollback = services.prefInt(PREF_SCROLLBACK, DEFAULT_SCROLLBACK)
@@ -85,6 +109,7 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
         // After setContentView: the insets controller only exists once the decor view does.
         goImmersive()
         terminal = findViewById(R.id.terminalView)
+        chat = findViewById(R.id.chatView)
         extraKeys = findViewById(R.id.extraKeys)
         imeInput = findViewById(R.id.imeInput)
 
@@ -112,6 +137,17 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
 
         wireIme()
 
+        // The guest, started here and not tied to this Activity's life. It is idempotent — a
+        // rotation asks again and the second ask is a no-op, because the first run's Apache is
+        // holding the port and a second would be a collision with itself — and it publishes one
+        // report, which is what the frame loop below waits for before deciding anything.
+        //
+        // After the shell, not before: `decideUiOrigin` reads the session's own filesystem, and a
+        // `lateinit` read before its assignment is a crash on every launch rather than a chat.
+        GuestRuntime.start(services, guestLog)
+
+        flashStatus("starting the Debian…")
+
         ui.postDelayed(poll, FRAME_MS)
         // Only after the terminal view has a size: the screen is resized to the real grid there,
         // and anything the shell wrote before that would be laid out for the wrong width.
@@ -122,6 +158,73 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
             }
         }
     }
+
+    // ---- the chat ------------------------------------------------------------------------
+
+    /**
+     * Whether the origin has been decided yet, and whether it can be now.
+     *
+     * **The wait is on the guest's start, not on its being up.**
+     * [com.omp.terminal.vm.GuestRuntime] resolves in a millisecond on a device with no Debian and in
+     * seconds on one with a guest, and either way the answer afterwards is final: [UiOrigins.choose]
+     * is a pure function of the disk, the token, the published URL and one boolean, so re-asking it
+     * later with the same four would return the same thing. Waiting is what makes it happen
+     * **once**, and once is the property worth having: a WebView that swapped origins under a user
+     * mid-sentence would be a worse bug than either origin.
+     */
+    private fun originDue(): Boolean = !originDecided && GuestRuntime.resolved
+
+    /**
+     * Which origin serves the chat, decided once, from the disk and from one boolean.
+     *
+     * **The WebView is loaded in every case and shown only when the guest is what is serving.**
+     * The origin is [UiOrigins.choose], which is [com.omp.terminal.web.UiOrigin.choose] over
+     * `omp.vm.provision.ProvisionState` *and* over the fact that a request for this build's own chat
+     * document came back from the guest's port; a page cannot reach this method, cannot cause it to
+     * be called twice, and cannot affect what it returns. A device with no guest shows the terminal,
+     * which is what a user who has provisioned nothing expects.
+     *
+     * **A guest that comes up while the user is in the terminal takes the screen, and Back gives it
+     * straight back.** The shell is untouched either way — the same [omp.shell.Session] keeps
+     * running and any command in it keeps running — so the switch costs a glance and not a session,
+     * and [onBackPressed] gives the terminal back without finishing anything. The alternative,
+     * refusing to switch while a job is in flight, would leave a user with a guest serving a page and
+     * no way to reach it.
+     *
+     * Null happens too: before the service has bound a port there is no address to load, and the
+     * terminal is shown with a toast saying so rather than an empty screen.
+     */
+    private fun decideUiOrigin() {
+        originDecided = true
+        val origin = UiOrigins.forDevice(this, services, shell.session.vfs)
+        if (origin == null) {
+            flashStatus("the chat server has not started yet")
+            return
+        }
+        chat.load(origin)
+        if (origin is GuestOrigin) {
+            showChat()
+            flashStatus("this chat is being served by ${origin.label()}")
+        } else {
+            showTerminal()
+        }
+    }
+
+    /** The chat, and not the terminal. */
+    private fun showChat() {
+        chat.visibility = View.VISIBLE
+        terminal.visibility = View.GONE
+        extraKeys.visibility = View.GONE
+    }
+
+    /** The terminal, and not the chat. */
+    private fun showTerminal() {
+        chat.visibility = View.GONE
+        terminal.visibility = View.VISIBLE
+        extraKeys.visibility = View.VISIBLE
+    }
+
+    private val chatShowing: Boolean get() = chat.visibility == View.VISIBLE
 
     // ---- soft keyboard ------------------------------------------------------------------
 
@@ -214,17 +317,29 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
         // repaint that has to happen on the way back, whether the user was in the phone's shell or
         // in the VM.
         active.screen.markAllDirty()
+        chat.onResume()
         if (!services.isExternalStorageManager()) flashStatus("all-files access not granted: run grant-storage")
     }
 
     override fun onPause() {
         super.onPause()
         ui.removeCallbacks(poll)
+        // The timers too, not only the renderer: a WebView that is off screen but not paused keeps
+        // running JavaScript on a phone that is trying to sleep.
+        chat.onPause()
     }
 
     // ---- back ----------------------------------------------------------------------------
 
     override fun onBackPressed() {
+        // The chat gets Back before the terminal does, and only while it is on screen: a page with
+        // history goes back one step, and a page without it gives the terminal back rather than
+        // exiting the app from inside a WebView.
+        if (chatShowing) {
+            if (chat.goBack()) return
+            showTerminal()
+            return
+        }
         // The session in front, not the phone's: a job running inside the VM is the job Back means.
         val job = active.foreground
         if (job != null) {
@@ -296,6 +411,11 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
                 finish()
                 return
             }
+            // The one thing this loop asks that is not about the screen. A volatile read and one
+            // comparison: the guest start is on its own thread and this is how the main thread
+            // learns it finished. `originDue` is false after the first decision, so the rest of the
+            // life of this Activity costs one boolean read per frame.
+            if (originDue()) decideUiOrigin()
             if (screen.isDirty()) terminal.requestRedraw()
             persistCellHeight()
             ui.postDelayed(this, FRAME_MS)
@@ -312,12 +432,49 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
         }
     }
 
+    /**
+     * Where the guest's own output goes.
+     *
+     * **The app's log and not the screen, and not nothing.** Apache and proot both write
+     * diagnostics, and the only copy a user ever gets of the interesting ones is the one `omp
+     * doctor` quotes out of the record — so this stream is a debugging convenience and a null target
+     * would be a way of losing a line that would have been the answer. It is a field because
+     * [GuestRuntime] keeps the guest for the life of the process while this Activity is destroyed
+     * and recreated by a rotation.
+     */
+    private val guestLog: OutputStream = object : OutputStream() {
+        override fun write(b: Int) {
+            Log.d("omp-guest", b.toInt().toChar().toString())
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            Log.d("omp-guest", String(b, off, len, Charsets.UTF_8))
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         ui.removeCallbacks(poll)
         terminal.destroy()
         input.close()
         shellThread?.interrupt()
+    }
+
+    /**
+     * `POST_NOTIFICATIONS`, on API 33 and up.
+     *
+     * **Asked once and never again.** A foreground service is required to show a notification, and
+     * a service nobody can see is a service nobody can stop, so without this grant the user is left
+     * with something running that they have no way to reach. A refusal is not fatal and is not
+     * re-asked: the service runs, the notification does not appear, and `web` in the terminal
+     * still says where the URL is.
+     */
+    private fun askForNotificationPermission() {
+        if (Build.VERSION.SDK_INT < 33) return
+        val wanted = android.Manifest.permission.POST_NOTIFICATIONS
+        if (checkSelfPermission(wanted) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(wanted), NOTIFICATION_PERMISSION)
+        }
     }
 
     companion object {
@@ -327,6 +484,7 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
         const val PREF_THEME = "theme"
         const val DEFAULT_SCROLLBACK = 2000
         private const val FRAME_MS = 16L
+        private const val NOTIFICATION_PERMISSION = 1
 
     }
 }

@@ -1,0 +1,384 @@
+/*
+ * omp, in a browser.
+ *
+ * Dark and light, because the terminal has both and a page that is only ever one of them is a
+ * page that is unreadable half the time. `auto` follows the device; the two buttons override it
+ * and the choice is remembered in this browser only.
+ *
+ * The layout is a phone's first: one column, the conversation list above the transcript, and a
+ * composer that is always in reach at the bottom. On a wide screen it becomes two columns, because
+ * a chat stretched across a desktop monitor is a chat with a word per line.
+ *
+ * Sizes are in rem and padding is in safe-area insets, so a phone with a notch and a browser that
+ * reflows on rotation both do the right thing without a media query for either.
+ */
+
+:root {
+  --bg: #101216;
+  --panel: #16191f;
+  --raised: #1d212a;
+  --line: #2a2f3a;
+  --fg: #e6e8ec;
+  --dim: #9aa2b1;
+  --accent: #6aa9ff;
+  --accent-fg: #06121f;
+  --bad: #ff8f8f;
+  --good: #7ddba0;
+  --mine: #1d3557;
+  --radius: 10px;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+}
+
+html[data-theme="light"], html[data-theme="auto"] {
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: light) {
+  html[data-theme="auto"] {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --raised: #eef0f4;
+    --line: #d9dde4;
+    --fg: #1b1e24;
+    --dim: #5c6472;
+    --accent: #1a5fd0;
+    --accent-fg: #ffffff;
+    --bad: #b3261e;
+    --good: #1c6b40;
+    --mine: #dbe8ff;
+  }
+}
+
+html[data-theme="light"] {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --raised: #eef0f4;
+  --line: #d9dde4;
+  --fg: #1b1e24;
+  --dim: #5c6472;
+  --accent: #1a5fd0;
+  --accent-fg: #ffffff;
+  --bad: #b3261e;
+  --good: #1c6b40;
+  --mine: #dbe8ff;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.55 var(--sans);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* ---- the bar ------------------------------------------------------------------------------ */
+
+#bar {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .625rem .875rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  flex: 0 0 auto;
+}
+
+#bar .name {
+  font-weight: 700;
+  letter-spacing: .06em;
+  margin-right: auto;
+}
+
+#bar .state {
+  color: var(--dim);
+  font-size: .8125rem;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button {
+  font: inherit;
+  font-size: .875rem;
+  color: var(--fg);
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: .4375rem .75rem;
+  cursor: pointer;
+}
+
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button:disabled:hover { border-color: var(--line); }
+button.primary {
+  color: var(--accent-fg);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+button.danger { color: var(--bad); }
+button.quiet { background: transparent; border-color: transparent; color: var(--dim); padding: .4375rem .5rem; }
+button.quiet:hover { color: var(--fg); border-color: var(--line); }
+
+/* ---- the two columns ----------------------------------------------------------------------- */
+
+#main {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+#side {
+  flex: 0 0 auto;
+  max-height: 38vh;
+  overflow: auto;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+#side .head {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .5rem .875rem;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+#side .head .label {
+  margin-right: auto;
+  font-size: .75rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.conversation {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  padding: .625rem .875rem;
+}
+
+.conversation[aria-current="true"] {
+  background: var(--raised);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.conversation .row { display: flex; gap: .5rem; align-items: baseline; }
+.conversation .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation .when { margin-left: auto; color: var(--dim); font-size: .75rem; white-space: nowrap; }
+.conversation .sub {
+  color: var(--dim);
+  font-size: .75rem;
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: .125rem;
+}
+
+.flag { font-size: .6875rem; color: var(--bad); }
+.flag.good { color: var(--good); }
+
+#where {
+  padding: .625rem .875rem;
+  color: var(--dim);
+  font-size: .75rem;
+  border-top: 1px solid var(--line);
+}
+
+#where .path {
+  display: block;
+  font-family: var(--mono);
+  color: var(--fg);
+  overflow-wrap: anywhere;
+  margin: .25rem 0 .5rem;
+}
+
+/* ---- the transcript ------------------------------------------------------------------------ */
+
+#log {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: .875rem;
+  display: flex;
+  flex-direction: column;
+  gap: .625rem;
+  min-height: 0;
+}
+
+.entry {
+  max-width: 46rem;
+  width: 100%;
+  margin: 0 auto;
+  padding: .625rem .75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.entry .who {
+  font-size: .6875rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: .25rem;
+}
+
+.entry.user { background: var(--mine); }
+.entry.tool { font-family: var(--mono); font-size: .8125rem; }
+.entry.system { color: var(--dim); font-size: .875rem; }
+.entry .body { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.entry .stream .body {
+  font-family: var(--mono);
+  font-size: .875rem;
+  white-space: pre-wrap;
+}
+
+.stream .line.note {
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: .8125rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.stream .line.note::before { content: ""; }
+
+.empty {
+  margin: auto;
+  color: var(--dim);
+  text-align: center;
+  max-width: 30rem;
+  padding: 2rem 1rem;
+}
+
+/* ---- the composer -------------------------------------------------------------------------- */
+
+#compose {
+  flex: 0 0 auto;
+  display: flex;
+  gap: .5rem;
+  align-items: flex-end;
+  padding: .625rem .875rem;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+#compose textarea {
+  flex: 1 1 auto;
+  resize: none;
+  min-height: 2.75rem;
+  max-height: 9rem;
+  padding: .625rem .75rem;
+  font: 16px/1.4 var(--sans);
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+#compose textarea:focus { outline: none; border-color: var(--accent); }
+
+/* ---- the approval -------------------------------------------------------------------------- */
+
+/*
+ * A write the agent wants to make. It is a dialog that does not go away: no backdrop click closes
+ * it, Escape does not close it, and there is no timer. The only two things that close it are the
+ * two buttons, and one of them is a decision about the user's files.
+ */
+#gate {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+  background: rgba(0, 0, 0, .62);
+}
+
+#gate .card {
+  width: 100%;
+  max-width: 34rem;
+  max-height: 85vh;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 14px;
+  padding: 1rem;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .45);
+}
+
+#gate h2 { margin: 0 0 .125rem; font-size: 1rem; }
+#gate .sub { margin: 0 0 .75rem; color: var(--dim); font-size: .8125rem; }
+#gate pre {
+  margin: 0 0 .875rem;
+  padding: .75rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font: .8125rem/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 45vh;
+  overflow: auto;
+}
+#gate .actions { display: flex; gap: .5rem; justify-content: flex-end; }
+#gate .actions button { min-width: 7rem; }
+
+/* ---- the wider layout ---------------------------------------------------------------------- */
+
+@media (min-width: 56rem) {
+  #main { flex-direction: row; }
+  #side {
+    max-height: none;
+    width: 20rem;
+    flex: 0 0 20rem;
+    border-bottom: 0;
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+  }
+  #list { flex: 1 1 auto; overflow: auto; }
+  #where { border-top: 1px solid var(--line); }
+  #pane { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+}
+
+@media (max-width: 55.999rem) {
+  #pane { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+}
+
+/* Discrete lines inside a turn: a refusal, an error, how the turn ended. They stack, and the
+   streaming line below them is the only thing that replaces itself. */
+.stream .notices .line {
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: .8125rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.stream .notices .line + .line { margin-top: .375rem; }
