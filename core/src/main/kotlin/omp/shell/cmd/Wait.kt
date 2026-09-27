@@ -15,6 +15,8 @@ object Wait : FileCommand() {
     override fun execute(ctx: ExecContext, flags: String, options: Map<String, String>, operands: List<String>): Int {
         val jobs = if (operands.isEmpty()) {
             ctx.session.jobs()
+            // The unfiltered index, on purpose: a job that has already finished still has a
+            // status, and this is the command that answers for it. `jobs` filters; this does not.
         } else {
             if (operands.size > 1) {
                 ctx.errLine("wait: too many arguments")

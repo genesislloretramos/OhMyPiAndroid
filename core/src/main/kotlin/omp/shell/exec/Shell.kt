@@ -34,6 +34,32 @@ class Shell(private val session: Session, val table: CommandTable = CommandTable
     /** Where diagnostics from a command substitution go, so they are not captured into its value. */
     var topStderr: OutputStream = NullOutput
 
+    /**
+     * The job this thread is running inside, for the pipelines a stage starts for itself. Stages
+     * each have a thread of their own, so this is per-stage and needs nothing but the thread; it
+     * is set around the stage and cleared in the same breath, so no thread outlives its value.
+     */
+    private val currentGroup = ThreadLocal<JobGroup?>()
+
+    /**
+     * Whether this thread is inside a `$( )` substitution, which is the child scope: a
+     * substitution is not the program the user typed, and what it does to `$?` and to the exit
+     * request stays inside it.
+     */
+    private val substituting = ThreadLocal<Boolean>()
+
+    /**
+     * Keeps [FINISHED_JOBS_KEPT] finished background jobs, dropping the oldest first. A pid is
+     * handed out in start order, so the lowest pid among the finished ones is the longest over.
+     * The bound is a person starting jobs faster than they wait for them, not a number of jobs a
+     * session runs: without it the table is every background job this session ever ran.
+     */
+    private fun retainFinishedJobs() {
+        val done = session.jobs().filterNot { it.isRunning() }
+        if (done.size <= FINISHED_JOBS_KEPT) return
+        for (job in done.sortedBy { it.pid }.take(done.size - FINISHED_JOBS_KEPT)) session.removeJob(job.pid)
+    }
+
     /** Runs one input line. A parse error is reported on stderr, not thrown at the caller. */
     fun executeLine(line: String, stdin: InputStream, stdout: OutputStream, stderr: OutputStream, tty: Boolean): Int {
         val program = try {
@@ -49,7 +75,7 @@ class Shell(private val session: Session, val table: CommandTable = CommandTable
         var status = session.lastStatus
         for (statement in program.statements) {
             status = runAndOr(statement.first, statement.rest, stdin, stdout, stderr, tty)
-            session.lastStatus = status
+            recordStatus(status)
             if (session.exitRequested) break
             if (session.errexit && status != 0) break
         }
@@ -65,15 +91,26 @@ class Shell(private val session: Session, val table: CommandTable = CommandTable
         tty: Boolean,
     ): Int {
         var status = runPipeline(first, stdin, stdout, stderr, tty)
-        session.lastStatus = status
+        // After every statement, not only at the end of the line: `$?` in the next statement of
+        // the same line is this one's answer.
+        recordStatus(status)
         for ((op, pipeline) in rest) {
             if (op == "AND_IF" && status != 0) continue
             if (op == "OR_IF" && status == 0) continue
             status = runPipeline(pipeline, stdin, stdout, stderr, tty)
-            session.lastStatus = status
+            recordStatus(status)
             if (session.exitRequested) break
         }
         return status
+    }
+
+    /**
+     * Records `$?`, which belongs to the program the user typed. A substitution is that program's
+     * child: it runs on a stage thread, and its own status is the value it hands back, not the one
+     * the user goes on to read.
+     */
+    private fun recordStatus(status: Int) {
+        if (substituting.get() != true) session.lastStatus = status
     }
 
     private fun runPipeline(node: PipelineNode, stdin: InputStream, stdout: OutputStream, stderr: OutputStream, tty: Boolean): Int {
@@ -81,7 +118,9 @@ class Shell(private val session: Session, val table: CommandTable = CommandTable
         if (stages.isEmpty()) return ExecContext.EXIT_OK
 
         val pid = if (node.background) session.allocatePid() else 0
-        val group = JobGroup(pid, listOf(stages.first().words.firstOrNull()?.raw ?: ""), node.background)
+        // A stage starts pipelines of its own -- a `$( )` substitution is one -- and those belong
+        // to the job that is running, which is the job `currentGroup` names on this thread.
+        val group = JobGroup(pid, listOf(stages.first().words.firstOrNull()?.raw ?: ""), node.background, currentGroup.get())
         if (node.background) session.lastBackgroundPid = pid
 
         val n = stages.size
@@ -102,15 +141,28 @@ class Shell(private val session: Session, val table: CommandTable = CommandTable
             val stageIn: InputStream = if (i == 0) stdin else pipeIns[i - 1]
             val stageOut: OutputStream = if (last) stdout else pipeOuts[i]
             val t = Thread({
-                // `last` is a position, not a destination: a command whose own output is
-                // redirected is not writing to the terminal whatever its place in the pipeline is.
-                group.status = runStage(
-                    stages[i], stageIn, stageOut, stderr, tty && last && !redirectsStdout(stages[i]), group,
-                )
-                // Without this the next stage blocks: a PipedInputStream only reports EOF once the
-                // writing end is closed, and it throws "Write end dead" once that thread is gone.
-                if (!last) closeQuietly(stageOut)
-                if (i != 0) closeQuietly(stageIn)
+                // Whatever this stage starts for itself -- a `$( )` substitution is a whole
+                // pipeline of its own -- belongs to this job, so the stage says which job it is
+                // part of for as long as it is running.
+                currentGroup.set(group)
+                try {
+                    // `last` is a position, not a destination: a command whose own output is
+                    // redirected is not writing to the terminal whatever its place in the pipeline is.
+                    val status = runStage(
+                        stages[i], stageIn, stageOut, stderr, tty && last && !redirectsStdout(stages[i]), group,
+                    )
+                    // Only the last stage decides the pipeline's status. An earlier stage that
+                    // returns later -- it is still being drained when the watcher counts down, or it
+                    // comes back after that -- must not overwrite the status already reported, or
+                    // `true | false` would answer with whatever the first stage happened to say.
+                    if (last) group.status = status
+                } finally {
+                    currentGroup.remove()
+                    // Without this the next stage blocks: a PipedInputStream only reports EOF once
+                    // the writing end is closed, and it throws "Write end dead" once that thread is gone.
+                    if (!last) closeQuietly(stageOut)
+                    if (i != 0) closeQuietly(stageIn)
+                }
             }, "omp-stage-$i")
             t.isDaemon = true
             threads += t
@@ -123,11 +175,24 @@ class Shell(private val session: Session, val table: CommandTable = CommandTable
                 // stage: tearing them down when the last one returns throws away whatever an
                 // earlier stage had already written.
                 threads.last().join()
-                for (i in 0 until threads.size - 1) threads[i].join(STAGE_DRAIN_MS)
+                for (i in 0 until threads.size - 1) {
+                    // A stage still running at the boundary is not awaited and not left to find
+                    // out: it is told, and the shell says it in a shape that cannot be read as a
+                    // command's own error. `sh: name: ...` is what a failure looks like, and this
+                    // is not one -- the command may well be perfectly happy, still reading, when
+                    // the stage it belongs to stopped waiting for it.
+                    threads[i].join(STAGE_DRAIN_MS)
+                    if (threads[i].isAlive) {
+                        group.cancel()
+                        val name = stages[i].words.firstOrNull()?.raw ?: "stage $i"
+                        stderr.write(("sh: abandoned: $name was still running when the last stage finished\n").toByteArray(Charsets.UTF_8))
+                        threads[i].join(ABANDON_GRACE_MS)
+                    }
+                }
             } finally {
                 group.finished.countDown()
                 if (node.background) {
-                    session.removeJob(pid)
+                    retainFinishedJobs()
                     closeQuietly(links)
                 }
             }
@@ -142,12 +207,18 @@ class Shell(private val session: Session, val table: CommandTable = CommandTable
             return ExecContext.EXIT_OK
         }
 
-        session.foreground = group
-        group.start()
-        val status = group.join()
-        session.foreground = null
-        closeQuietly(links)
-        return status
+        // Ctrl-C means the job the user is looking at, and that is the outermost one. A pipeline a
+        // stage started for itself neither takes the slot nor leaves it empty on the way out: a
+        // null slot is an interrupt that silently does nothing, which on a phone is the keyboard.
+        val ownsSlot = session.foreground == null
+        if (ownsSlot) session.foreground = group
+        try {
+            group.start()
+            return group.join()
+        } finally {
+            if (ownsSlot && session.foreground === group) session.foreground = null
+            closeQuietly(links)
+        }
     }
 
     /**
@@ -360,11 +431,28 @@ class Shell(private val session: Session, val table: CommandTable = CommandTable
         val buffer = ByteArrayOutputStream()
         try {
             val program = Parser.parse(body)
-            executeProgram(program, ByteArrayInputStream(EMPTY), buffer, topStderr, false)
+            runSubstitution(program, buffer)
         } catch (e: ShellParseException) {
             topStderr.write(("sh: ${e.message}\n").toByteArray(Charsets.UTF_8))
         }
         return String(buffer.toByteArray(), Charsets.UTF_8).trimEnd('\n')
+    }
+
+    /**
+     * Runs a substitution as a child of whatever is running it, which is what it is. `$(exit)`
+     * ends the substitution and not the program typed around it -- `executeProgram` stops on the
+     * request, and it is put back as it was found on the way out -- and while the substitution
+     * runs, `$?` is the outer program's to move and this one does not touch it.
+     */
+    private fun runSubstitution(program: Program, buffer: ByteArrayOutputStream) {
+        val outerExit = session.exitRequested
+        substituting.set(true)
+        try {
+            executeProgram(program, ByteArrayInputStream(EMPTY), buffer, topStderr, false)
+        } finally {
+            substituting.remove()
+            session.exitRequested = outerExit
+        }
     }
 
     companion object {
@@ -372,6 +460,12 @@ class Shell(private val session: Session, val table: CommandTable = CommandTable
 
         /** How long an earlier stage may keep writing after the last stage has returned. */
         const val STAGE_DRAIN_MS = 2000L
+
+        /** How long an abandoned stage gets to notice it was abandoned, before the shell moves on. */
+        const val ABANDON_GRACE_MS = 250L
+
+        /** How many finished background jobs stay answerable to `wait <pid>`. */
+        const val FINISHED_JOBS_KEPT = 32
         private val EMPTY = ByteArray(0)
 
         val NullOutput: OutputStream = object : OutputStream() {

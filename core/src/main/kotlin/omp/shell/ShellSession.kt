@@ -110,17 +110,16 @@ class ShellSession(
         }
     }
 
-    private fun run(line: String): Int {
-        val status = try {
-            shell.executeLine(line, stdin, screenOut, screenOut, true)
-        } catch (e: Exception) {
-            screen.write("sh: ${e.message ?: e::class.java.simpleName}\n")
-            ExecContext.EXIT_GENERAL_ERROR
-        }
-        val job = session.foreground
-        if (job != null && job.cancelled.get()) screen.write("^C\n")
-        return status
+    private fun run(line: String): Int = try {
+        shell.executeLine(line, stdin, screenOut, screenOut, true)
+    } catch (e: Exception) {
+        screen.write("sh: ${e.message ?: e::class.java.simpleName}\n")
+        ExecContext.EXIT_GENERAL_ERROR
     }
+    // Nothing is echoed here. A job is in `session.foreground` only while its command is running,
+    // so by the time this returns the slot is empty again and there is no line left to cancel.
+    // The `^C` a person sees is the line editor's own, written the moment the key arrives
+    // (`LineEditor`, CTRL_C), whether it cut short what they were typing or what they waited for.
 
     /** `[namespaceLabel]:` in bold green — `omp:` when there is no namespace — then cwd in bold blue and `$ `. */
     fun prompt(): String {
