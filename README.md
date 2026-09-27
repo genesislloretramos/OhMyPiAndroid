@@ -48,7 +48,7 @@ export ANDROID_HOME="$HOME/Android/Sdk"
 echo "sdk.dir=$ANDROID_HOME" > local.properties
 
 ./gradlew :app:assembleDebug     # app/build/outputs/apk/debug/app-debug.apk
-./gradlew :core:test             # 529 tests: the shell's whole behaviour, on the JVM, in a few seconds
+./gradlew :core:test             # 575 tests: the shell's whole behaviour, on the JVM, in about half a minute
 ```
 
 ## Use it
@@ -292,7 +292,7 @@ afternoon to them:
 ## Layout
 
 ```
-core/   the shell. Plain JVM, no android.* imports, so it unit-tests in milliseconds.
+core/   the shell. Plain JVM, no android.* imports, so all of it runs under :core:test.
 app/    the Activity, the view that draws the screen, and the platform commands.
 ```
 
