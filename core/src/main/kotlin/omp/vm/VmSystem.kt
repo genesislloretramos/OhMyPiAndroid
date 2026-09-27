@@ -5,7 +5,10 @@ import omp.shell.PlatformServices
 import omp.shell.SessionHost
 import omp.shell.ShellSession
 import omp.shell.exec.CommandTable
+import omp.shell.fs.Vfs
 import omp.term.Screen
+import omp.vm.provision.ProvisionPaths
+import omp.vm.provision.ProvisionState
 import java.io.File
 
 /**
@@ -113,6 +116,39 @@ class VmSystem(
     fun shutdown() {
         kernel.shutdown()
     }
+
+    /**
+     * What this device has of the real `omp` agent: a Debian, a downloaded binary, and the guest's
+     * own LAMP — three facts, read from the disk and from nothing else.
+     *
+     * A [VmSystem] answers for a namespace this app generates in memory, and it has done so since
+     * before anything was downloaded. This is the other half of the same question — *which agent
+     * is a user talking to*, and *what does the Debian inside it hold* — and it is here rather than
+     * in the launcher because the app holds a [VmSystem] and the answer belongs next to it.
+     *
+     * The host [vfs] is a parameter and not a guess: a namespace's own [Vfs] resolves paths inside
+     * the VM's rootfs, and the Debian and the agent live in the app's own storage, which is outside
+     * it. `RealVfs()` is the one this wants, and passing it is the caller's statement that the
+     * paths are host paths.
+     *
+     * Nothing here downloads anything, and a report of `false` is not an error: on an unprovisioned
+     * device, and on every 32-bit device for ever, the Kotlin agent in this build is the answer.
+     * The third fact is read from a mark inside the Debian rather than remembered, which is what
+     * makes [omp.vm.provision.GuestPackages] runnable again after a failed install instead of
+     * claiming a guest holds LAMP because a boolean in memory said so once.
+     */
+    fun provisioning(vfs: Vfs, paths: ProvisionPaths): ProvisionState = paths.state(vfs)
+
+    /**
+     * The directory inside the provisioned Debian that Apache serves the app's pages from.
+     *
+     * Named here, next to [provisioning], because a caller that shows the user where their chat
+     * is being served from needs the one path — the one Debian's `apache2` package configures as
+     * its `DocumentRoot` — and not a string it spells out again. It is a path inside the rootfs
+     * whether or not anything is provisioned yet, so a caller that is about to provision can quote
+     * it in the sentence asking.
+     */
+    fun documentRoot(paths: ProvisionPaths): String = paths.webRoot
 
     private fun hostName(): String = try {
         String(kernel.vfs.readBytes("/etc/hostname"), Charsets.UTF_8).trim()
