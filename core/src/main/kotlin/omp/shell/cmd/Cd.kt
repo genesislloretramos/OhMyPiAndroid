@@ -2,18 +2,16 @@ package omp.shell.cmd
 
 import omp.shell.exec.Command
 import omp.shell.exec.CommandSpec
-import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
-import java.io.File
-import java.io.IOException
-import java.nio.file.Files
-import java.nio.file.attribute.BasicFileAttributes
+import omp.shell.fs.FsException
+import omp.shell.fs.VNodeType
 
 @CommandSpec(
     name = "cd",
     synopsis = "[dir]",
     group = "files",
-    notes = "no argument goes to \$HOME, `cd -` goes to OLDPWD and prints the new directory",
+    notes = "no argument goes to \$HOME, `cd -` goes to OLDPWD and prints the new directory; " +
+        "\$PWD stays the logical path, so `..` is applied to what you typed, not to where a link points",
 )
 object Cd : Command {
 
@@ -35,16 +33,16 @@ object Cd : Command {
             announce = false
         }
         val path = Cmds.resolve(ctx, raw) ?: return ExecContext.EXIT_GENERAL_ERROR
-        val file = File(path)
-        // A directory the app may not stat is Permission denied, not "No such file or directory".
-        val attrs = try {
-            Files.readAttributes(file.toPath(), BasicFileAttributes::class.java)
-        } catch (e: IOException) {
-            return ctx.fail("cd: $raw: ${Errno.messageFor(e)}")
-        } catch (e: SecurityException) {
-            return ctx.fail("cd: $raw: Permission denied")
+        // A directory the app may not stat is Permission denied, not "No such file or directory",
+        // and that is a distinction the seam's own errnos already make.
+        // A link to a directory is a directory to `cd`, and `$PWD` keeps the name that was typed,
+        // which is what makes `cd -` and a prompt mean the same thing afterwards.
+        val stat = try {
+            Cmds.statFollowed(ctx.session.vfs, path)
+        } catch (e: FsException) {
+            return ctx.fail("cd: $raw: ${e.errno.text}")
         }
-        if (!attrs.isDirectory) return ctx.fail("cd: $raw: Not a directory")
+        if (stat.type != VNodeType.DIRECTORY) return ctx.fail("cd: $raw: Not a directory")
 
         ctx.session.oldPwd = ctx.session.cwd
         ctx.session.cwd = path

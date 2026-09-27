@@ -1,13 +1,12 @@
 package omp.shell.cmd
 
 import omp.shell.exec.CommandSpec
-import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
 import omp.shell.exec.printUsage
-import java.io.File
-import java.io.IOException
-import java.io.RandomAccessFile
+import omp.shell.fs.FsErrno
+import omp.shell.fs.FsException
+import omp.shell.fs.Vfs
 
 @CommandSpec(
     name = "truncate",
@@ -35,23 +34,25 @@ object Truncate : FileCommand() {
         if (operands.isEmpty()) return ctx.fail("truncate: missing file operand")
 
         var status = ExecContext.EXIT_OK
+        val vfs = ctx.session.vfs
         for (op in operands) {
             val path = Cmds.resolve(ctx, op) ?: run {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val file = File(path)
             if (size == 0L) {
-                if (fsExists(file) && !fsDeleteFile(ctx, "truncate", op, file)) {
+                if (fsExists(vfs, path) && !fsDeleteFile(ctx, "truncate", op, vfs, path)) {
                     status = ExecContext.EXIT_GENERAL_ERROR
                 }
                 continue
             }
-            if (!fsExists(file)) {
-                val created = try {
-                    file.createNewFile()
-                } catch (e: IOException) {
-                    ctx.errLine("truncate: $op: ${Errno.messageFor(e)}")
+            if (!fsExists(vfs, path)) {
+                // O_CREAT|O_EXCL: a name that appeared between the two answers as `File exists`, and
+                // a path with nowhere to put it as whatever the seam could not create it for.
+                try {
+                    vfs.createFile(path)
+                } catch (e: FsException) {
+                    ctx.errLine("truncate: $op: ${e.errno.text}")
                     status = ExecContext.EXIT_GENERAL_ERROR
                     continue
                 } catch (e: SecurityException) {
@@ -59,18 +60,12 @@ object Truncate : FileCommand() {
                     status = ExecContext.EXIT_GENERAL_ERROR
                     continue
                 }
-                if (!created) {
-                    ctx.errLine("truncate: $op: File exists")
-                    status = ExecContext.EXIT_GENERAL_ERROR
-                }
             }
             val failure = try {
-                RandomAccessFile(file, "rw").use { raf ->
-                    raf.setLength(size)
-                }
+                resize(vfs, vfs.realpath(path), size)
                 null
-            } catch (e: IOException) {
-                Errno.messageFor(e)
+            } catch (e: FsException) {
+                e.errno.text
             } catch (e: SecurityException) {
                 "Permission denied"
             }
@@ -80,6 +75,20 @@ object Truncate : FileCommand() {
             }
         }
         return status
+    }
+
+    /**
+     * The seam sets no length, so the file is read and written back at the size asked for: the
+     * bytes it had, cut or zero-padded. Truncating through [Vfs.writeBytes] keeps the name, the
+     * inode and the permissions, which is what `truncate(1)` promises.
+     */
+    private fun resize(vfs: Vfs, path: String, size: Long) {
+        if (size > Int.MAX_VALUE) throw FsException(FsErrno.INVALID_ARGUMENT, path)
+        val current = if (fsExists(vfs, path)) vfs.readBytes(path) else ByteArray(0)
+        if (current.size == size.toInt()) return
+        val out = ByteArray(size.toInt())
+        System.arraycopy(current, 0, out, 0, if (current.size < out.size) current.size else out.size)
+        vfs.writeBytes(path, out)
     }
 
     private fun parseSize(raw: String): Long? {

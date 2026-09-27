@@ -3,7 +3,9 @@ package omp.shell.cmd
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
+import omp.shell.fs.VNodeType
+import omp.shell.fs.VStat
+import omp.shell.fs.Vfs
 
 @CommandSpec(
     name = "ls",
@@ -20,7 +22,8 @@ object Ls : FileCommand() {
 
     private fun sgr(body: String) = "$esc[${body}m"
 
-    private class Item(val name: String, val file: File)
+    /** A name to print, the path it names, and the metadata a listing already holds for it. */
+    private class Item(val name: String, val path: String, val stat: VStat, val vfs: Vfs)
 
     private class Settings(
         val long: Boolean,
@@ -63,6 +66,7 @@ object Ls : FileCommand() {
         val fromCwd = operands.isEmpty()
         val roots = if (fromCwd) listOf(".") else operands
         val headers = roots.size > 1 || settings.recursive
+        val vfs = ctx.session.vfs
 
         var status = ExecContext.EXIT_OK
         for (raw in roots) {
@@ -71,31 +75,41 @@ object Ls : FileCommand() {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val file = File(path)
-            if (!file.exists()) {
+            // The name as typed: `ls -l link` shows a link, its own size and where it points, which
+            // is the only way a listing can show that a link exists at all.
+            val stat = fsStatOrNull(vfs, path)
+            if (stat == null) {
                 ctx.errLine("ls: $raw: No such file or directory")
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            if (file.isDirectory && !dirItself) {
+            if (stat.type == VNodeType.DIRECTORY && !dirItself) {
                 if (headers && !fromCwd) ctx.outLine("$raw:")
-                val rc = listDirectory(ctx, file, settings, headers)
+                val rc = listDirectory(ctx, vfs, path, stat, settings, headers)
                 if (rc != ExecContext.EXIT_OK) status = rc
             } else {
-                emit(ctx, listOf(Item(raw, file)), settings)
+                emit(ctx, listOf(Item(raw, path, stat, vfs)), settings)
             }
         }
         return status
     }
 
-    private fun listDirectory(ctx: ExecContext, dir: File, s: Settings, headers: Boolean): Int {
-        val entries = Cmds.listDir(ctx, "ls", dir) ?: return ExecContext.EXIT_GENERAL_ERROR
+    private fun listDirectory(
+        ctx: ExecContext,
+        vfs: Vfs,
+        dir: String,
+        dirStat: VStat,
+        s: Settings,
+        headers: Boolean,
+    ): Int {
+        val entries = Cmds.listDir(ctx, "ls", vfs, dir) ?: return ExecContext.EXIT_GENERAL_ERROR
         val items = ArrayList<Item>(entries.size + 2)
         if (s.showAll) {
-            items += Item(".", dir)
-            items += Item("..", dir)
+            // `.` and `..` are the directory itself: a listing of them is a listing of its mode.
+            items += Item(".", dir, dirStat, vfs)
+            items += Item("..", dir, dirStat, vfs)
         }
-        for (e in entries) items += Item(e.name, e)
+        for (e in entries) items += Item(e.name, fsChild(dir, e.name), e.stat, vfs)
         sort(items, s)
         emit(ctx, items, s)
         if (headers && s.recursive) ctx.outLine()
@@ -105,10 +119,11 @@ object Ls : FileCommand() {
         for (item in items) {
             if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
             // A symlinked directory is listed but not descended into: `ls -R` does not follow links.
-            if (item.name == "." || item.name == ".." || fsIsLink(item.file)) continue
-            if (!item.file.isDirectory) continue
+            if (item.name == "." || item.name == "..") continue
+            if (item.stat.type == VNodeType.SYMLINK) continue
+            if (item.stat.type != VNodeType.DIRECTORY) continue
             ctx.outLine(item.name + ":")
-            val rc = listDirectory(ctx, item.file, s, true)
+            val rc = listDirectory(ctx, vfs, item.path, item.stat, s, true)
             if (rc != ExecContext.EXIT_OK) status = rc
         }
         return status
@@ -117,8 +132,8 @@ object Ls : FileCommand() {
     private fun sort(items: MutableList<Item>, s: Settings) {
         // -S and -t both replace the name order; a stable sort keeps the earlier one as the tie-break.
         val base: Comparator<Item> = when {
-            s.bySize -> Comparator<Item> { a, b -> Cmds.sizeOf(b.file).compareTo(Cmds.sizeOf(a.file)) }
-            s.byTime -> Comparator<Item> { a, b -> b.file.lastModified().compareTo(a.file.lastModified()) }
+            s.bySize -> Comparator<Item> { a, b -> Cmds.sizeOf(b.stat).compareTo(Cmds.sizeOf(a.stat)) }
+            s.byTime -> Comparator<Item> { a, b -> b.stat.mtimeMillis.compareTo(a.stat.mtimeMillis) }
             else -> Comparator<Item> { a, b -> fsCompareC(a.name, b.name) }
         }
         items.sortWith(if (s.reverse) base.reversed() else base)
@@ -151,13 +166,13 @@ object Ls : FileCommand() {
     }
 
     private fun longLine(item: Item, s: Settings): String {
-        val file = item.file
         val sb = StringBuilder()
-        sb.append(Cmds.perms(file)).append(' ')
-        sb.append(Cmds.humanSize(Cmds.sizeOf(file), s.human)).append(' ')
-        sb.append(Cmds.timestamp(file.lastModified())).append(' ')
+        sb.append(Cmds.perms(item.stat)).append(' ')
+        sb.append(Cmds.humanSize(Cmds.sizeOf(item.stat), s.human)).append(' ')
+        sb.append(Cmds.timestamp(item.stat.mtimeMillis)).append(' ')
         sb.append(paint(item, s.color))
-        val target = if (fsIsLink(file)) fsLinkTarget(file) else null
+        // The metadata a listing already holds says whether this is a link, so no second stat.
+        val target = if (item.stat.type == VNodeType.SYMLINK) fsLinkTarget(item.vfs, item.path) else null
         if (target != null) {
             sb.append(" -> ")
             sb.append(if (s.color) sgr("36") + target + sgr("0") else target)
@@ -167,16 +182,16 @@ object Ls : FileCommand() {
 
     /**
      * Directory blue, symlink cyan, executable green, anything that is not a regular file yellow.
-     * `java.io` cannot tell a device node from a fifo, so the yellow covers every special file.
+     * A device node, a fifo and a socket are one thing to a [VStat] built from the JDK, so the
+     * yellow covers every special file.
      */
     private fun paint(item: Item, color: Boolean): String {
-        val file = item.file
         if (!color) return item.name
         val body = when {
-            fsIsLink(file) -> sgr("36")
-            file.isDirectory -> sgr("1;34")
-            file.canExecute() -> sgr("1;32")
-            !file.isFile -> sgr("1;33")
+            item.stat.type == VNodeType.SYMLINK -> sgr("36")
+            item.stat.type == VNodeType.DIRECTORY -> sgr("1;34")
+            item.stat.executable -> sgr("1;32")
+            item.stat.type != VNodeType.FILE -> sgr("1;33")
             else -> return item.name
         }
         return body + item.name + sgr("0")

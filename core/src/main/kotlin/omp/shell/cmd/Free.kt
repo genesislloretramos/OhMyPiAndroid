@@ -3,7 +3,6 @@ package omp.shell.cmd
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
 
 @CommandSpec(
     name = "free",
@@ -40,9 +39,10 @@ object Free : FileCommand() {
         return ExecContext.EXIT_OK
     }
 
+    /** Through the seam, because `/proc/meminfo` is a file like any other and a phone may close it. */
     private fun readMeminfo(ctx: ExecContext): Map<String, Long>? = try {
         val out = HashMap<String, Long>()
-        for (line in File("/proc/meminfo").readLines()) {
+        for (line in String(ctx.session.vfs.readBytes("/proc/meminfo"), Charsets.UTF_8).lines()) {
             val colon = line.indexOf(':')
             if (colon <= 0) continue
             val key = line.substring(0, colon)

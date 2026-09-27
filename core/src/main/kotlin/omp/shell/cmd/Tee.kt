@@ -5,9 +5,8 @@ import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
 import omp.shell.exec.printUsage
+import omp.shell.fs.FsException
 import java.io.BufferedOutputStream
-import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 
@@ -33,6 +32,7 @@ object Tee : FileCommand() {
             return ExecContext.EXIT_USAGE
         }
         val append = 'a' in flags
+        val vfs = ctx.session.vfs
         val files = ArrayList<Pair<String, OutputStream>>()
         var errored = false
         for (op in operands) {
@@ -41,15 +41,14 @@ object Tee : FileCommand() {
                 errored = true
                 continue
             }
-            val file = File(path)
-            if (file.isDirectory) {
-                ctx.errLine("tee: $op: Is a directory")
-                errored = true
-                continue
-            }
             try {
-                files += op to BufferedOutputStream(FileOutputStream(file, append), 32 * 1024)
-            } catch (e: IOException) {
+                // The seam refuses a directory with `Is a directory`, which is the wording this
+                // command has always printed for one, so there is no check to make here first.
+                files += op to BufferedOutputStream(vfs.openWrite(path, append), 32 * 1024)
+            } catch (e: FsException) {
+                Errno.report(ctx, "tee", op, e)
+                errored = true
+            } catch (e: SecurityException) {
                 Errno.report(ctx, "tee", op, e)
                 errored = true
             }

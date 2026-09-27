@@ -1,11 +1,12 @@
 package omp.shell.cmd
 
 import omp.shell.exec.CommandSpec
-import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
-import java.io.IOException
+import omp.shell.fs.FsException
+import omp.shell.fs.FsErrno
+import omp.shell.fs.VNodeType
+import omp.shell.fs.Vfs
 
 @CommandSpec(
     name = "mkdir",
@@ -25,30 +26,31 @@ object Mkdir : FileCommand() {
     ): Int {
         if (operands.isEmpty()) return ctx.fail("mkdir: missing operand")
         val parents = 'p' in flags
+        val vfs = ctx.session.vfs
         var status = ExecContext.EXIT_OK
         for (op in operands) {
             val path = Cmds.resolve(ctx, op) ?: run {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val dir = File(path)
-            if (dir.isDirectory) {
-                if (!parents) {
+            val existing = fsStatOrNull(vfs, path)
+            if (existing != null) {
+                // -p accepts a directory that is already there and refuses a file either way.
+                if (!parents || existing.type != VNodeType.DIRECTORY) {
                     ctx.errLine("mkdir: $op: File exists")
                     status = ExecContext.EXIT_GENERAL_ERROR
                 }
                 continue
             }
-            if (fsExists(dir)) {
-                ctx.errLine("mkdir: $op: File exists")
-                status = ExecContext.EXIT_GENERAL_ERROR
-                continue
-            }
             val failure = try {
-                val ok = if (parents) dir.mkdirs() else dir.mkdir()
-                if (ok) null else reason(dir, parents)
-            } catch (e: IOException) {
-                Errno.messageFor(e)
+                // The seam makes one level at a time, so -p is the loop and the rest is a single call.
+                val ok = if (parents) fsMakeDirs(vfs, path) else {
+                    vfs.mkdir(path)
+                    true
+                }
+                if (ok) null else reason(vfs, path, parents)
+            } catch (e: FsException) {
+                e.errno.text
             } catch (e: SecurityException) {
                 "Permission denied"
             }
@@ -60,10 +62,12 @@ object Mkdir : FileCommand() {
         return status
     }
 
-    private fun reason(dir: File, parents: Boolean): String {
-        if (fsExists(dir)) return "File exists"
-        if (!parents) return "No such file or directory"
-        val parent = dir.parentFile ?: return "No such file or directory"
-        return if (parent.exists()) "Not a directory" else "No such file or directory"
+    /** Why a `mkdir` that did not create the directory did not. */
+    private fun reason(vfs: Vfs, path: String, parents: Boolean): String {
+        if (fsExists(vfs, path)) return FsErrno.FILE_EXISTS.text
+        if (!parents) return FsErrno.NO_SUCH_FILE.text
+        val parent = path.substringBeforeLast('/', "")
+        return if (parent.isNotEmpty() && fsExists(vfs, parent)) FsErrno.NOT_A_DIRECTORY.text
+        else FsErrno.NO_SUCH_FILE.text
     }
 }

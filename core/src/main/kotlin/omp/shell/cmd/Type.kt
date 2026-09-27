@@ -15,7 +15,7 @@ object Type : FileCommand() {
         var status = ExecContext.EXIT_OK
         for (name in operands) {
             when {
-                isShellCommand(name) -> ctx.outLine("$name is a shell command")
+                isShellCommand(ctx, name) -> ctx.outLine("$name is a shell command")
                 ctx.session.aliases.containsKey(name) ->
                     ctx.outLine("$name is aliased to '${ctx.session.aliases[name]}'")
                 else -> {

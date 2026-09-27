@@ -4,7 +4,8 @@ import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
 import omp.shell.fs.PathResolver
-import java.io.File
+import omp.shell.fs.VNodeType
+import omp.shell.fs.Vfs
 
 @CommandSpec(
     name = "tree",
@@ -41,15 +42,24 @@ object Tree : FileCommand() {
 
         val shown = operands.firstOrNull() ?: "."
         val path = Cmds.resolve(ctx, shown) ?: return ExecContext.EXIT_GENERAL_ERROR
-        val root = File(path)
-        if (!root.exists()) return ctx.fail("tree: $shown: No such file or directory")
-        if (!root.isDirectory) return ctx.fail("tree: $shown: Not a directory")
+        val vfs = ctx.session.vfs
+        val root = fsStatOrNull(vfs, path) ?: return ctx.fail("tree: $shown: No such file or directory")
+        if (root.type == VNodeType.SYMLINK) {
+            // A link operand is a link, not the directory behind it: print it and stop, the way
+            // `tree` has always printed a link it meets inside a tree.
+            ctx.outLine(if (operands.isEmpty()) PathResolver.contract(ctx.session, path) else shown)
+            ctx.outLine("$shown -> " + (fsLinkTarget(vfs, path) ?: ""))
+            ctx.outLine()
+            ctx.outLine("0 directories, 0 files")
+            return ExecContext.EXIT_OK
+        }
+        if (root.type != VNodeType.DIRECTORY) return ctx.fail("tree: $shown: Not a directory")
 
         ctx.outLine(if (operands.isEmpty()) PathResolver.contract(ctx.session, path) else shown)
         val counts = IntArray(2)
         var status = ExecContext.EXIT_OK
         if (maxDepth > 0) {
-            status = walk(ctx, root, "", 1, maxDepth, all, dirsOnly, counts)
+            status = walk(ctx, vfs, path, "", 1, maxDepth, all, dirsOnly, counts)
         }
         if (status == ExecContext.EXIT_INTERRUPTED) return status
         ctx.outLine()
@@ -64,7 +74,8 @@ object Tree : FileCommand() {
 
     private fun walk(
         ctx: ExecContext,
-        dir: File,
+        vfs: Vfs,
+        dir: String,
         prefix: String,
         depth: Int,
         maxDepth: Int,
@@ -72,21 +83,23 @@ object Tree : FileCommand() {
         dirsOnly: Boolean,
         counts: IntArray,
     ): Int {
-        val entries = Cmds.listDir(ctx, "tree", dir) ?: return ExecContext.EXIT_GENERAL_ERROR
+        val entries = Cmds.listDir(ctx, "tree", vfs, dir) ?: return ExecContext.EXIT_GENERAL_ERROR
         val visible = entries.filter { all || !it.name.startsWith(".") }.sortedBy { it.name }
         for (i in visible.indices) {
             if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
             val entry = visible[i]
+            val child = fsChild(dir, entry.name)
             val last = i == visible.size - 1
-            val link = fsIsLink(entry)
-            val isDir = entry.isDirectory
+            val link = entry.stat.type == VNodeType.SYMLINK
+            // A link to a directory is a directory as far as the counts go, and is never walked.
+            val isDir = if (link) fsIsDirFollowing(vfs, child, entry.stat) else entry.stat.type == VNodeType.DIRECTORY
             if (!dirsOnly || isDir) {
                 counts[if (isDir) 0 else 1]++
-                val target = if (link) " -> " + (fsLinkTarget(entry) ?: "") else ""
+                val target = if (link) " -> " + (fsLinkTarget(vfs, child) ?: "") else ""
                 ctx.outLine(prefix + (if (last) BRANCH_END else BRANCH_MID) + entry.name + target)
             }
             if (isDir && !link && depth < maxDepth) {
-                val rc = walk(ctx, entry, prefix + (if (last) BLANK else PIPE), depth + 1, maxDepth, all, dirsOnly, counts)
+                val rc = walk(ctx, vfs, child, prefix + (if (last) BLANK else PIPE), depth + 1, maxDepth, all, dirsOnly, counts)
                 if (rc != ExecContext.EXIT_OK) return rc
             }
         }

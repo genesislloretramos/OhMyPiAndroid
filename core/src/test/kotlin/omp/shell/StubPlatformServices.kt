@@ -1,5 +1,7 @@
 package omp.shell
 
+import java.io.File
+
 /**
  * A JVM implementation of [PlatformServices] for tests: a temp directory as `$HOME`, fixed
  * properties, and no device behind any of it.
@@ -9,6 +11,14 @@ class StubPlatformServices(
     val initialDir: String,
     val external: String? = null,
     allFilesGranted: Boolean = true,
+
+    /**
+     * The app's private storage, i.e. the directory `home` sits in — which is how the real
+     * implementation reads, `home` being `files/home`. Defaulted from `home` so a test that only
+     * cares about `$HOME` says nothing about this, and a test that cares passes it explicitly.
+     */
+    val appFiles: String = File(home).absoluteFile.parentFile?.absolutePath
+        ?: File(home).absolutePath,
 ) : PlatformServices {
 
     var homeOverride: String? = null
@@ -34,6 +44,8 @@ class StubPlatformServices(
     var monotonic = 3_600_000L
 
     override fun homeDir(): String = home
+
+    override fun appFilesDir(): String = appFiles
     override fun initialDirectory(): String = initialDir
     override fun externalStorageDir(): String? = external
 

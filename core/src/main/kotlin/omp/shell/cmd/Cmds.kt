@@ -2,11 +2,14 @@ package omp.shell.cmd
 
 import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
+import omp.shell.fs.FsException
 import omp.shell.fs.PathException
 import omp.shell.fs.PathResolver
+import omp.shell.fs.VEntry
+import omp.shell.fs.VNodeType
+import omp.shell.fs.VStat
+import omp.shell.fs.Vfs
 import java.io.BufferedReader
-import java.io.File
-import java.io.FileInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.InputStreamReader
@@ -16,7 +19,8 @@ import java.util.Locale
 
 /**
  * Helpers every command shares. Anything two commands need belongs here rather than being written
- * twice, because the two copies drift.
+ * twice, because the two copies drift. Every filesystem answer comes from the session's
+ * [omp.shell.fs.Vfs], so a path a command resolves is the path its own namespace answers for.
  */
 object Cmds {
 
@@ -38,43 +42,66 @@ object Cmds {
     }
 
     /**
-     * `File.listFiles()` returns null for an unreadable directory, which is the single most common
-     * real case on Android (every other app's /data/data/<pkg>). Every tree walk must treat that as
-     * `Permission denied` and never as an empty directory.
+     * The entries of [path], or null with the reason already on stderr. An unreadable directory is
+     * the single most common real case on Android (every other app's /data/data/<pkg>), and it has
+     * to reach the user as `Permission denied` rather than as an empty directory — [Vfs] answers
+     * that with an [omp.shell.fs.FsErrno.PERM_DENIED] for exactly this reason.
+     *
+     * Every entry carries the [VStat] of the node behind it, so a walk never asks about the same
+     * name twice.
      */
-    fun listDir(ctx: ExecContext, op: String, dir: File): Array<File>? {
-        if (!dir.exists()) {
-            ctx.errLine("$op: ${dir.path}: No such file or directory")
-            return null
-        }
-        if (!dir.isDirectory) {
-            ctx.errLine("$op: ${dir.path}: Not a directory")
-            return null
-        }
-        val entries = try {
-            dir.listFiles()
-        } catch (e: SecurityException) {
-            null
-        }
-        if (entries == null) {
-            ctx.errLine("$op: ${dir.path}: Permission denied")
-            return null
-        }
-        return entries
+    fun listDir(ctx: ExecContext, op: String, vfs: Vfs, path: String): List<VEntry>? = try {
+        vfs.readDir(path)
+    } catch (e: FsException) {
+        ctx.errLine("$op: $path: ${e.errno.text}")
+        null
+    }
+    /**
+     * The node the name itself is, with a symbolic link left as a [VNodeType.SYMLINK]: `rm`,
+     * `rmdir`, `mv`, `ln`, `readlink`, `stat`, `ls -l`, `find`'s type tests and `tree` all act on
+     * the name the user typed, so none of them may be handed the target instead.
+     *
+     * Throws [FsException]; a caller that has to report a missing path in its own voice uses
+     * [statOrNull] instead.
+     */
+    fun statLink(vfs: Vfs, path: String): VStat = vfs.stat(path)
+
+    /**
+     * The node a path finally names, with one [Vfs.realpath] hop first: `cd`, `test -e/-f/-d/-s`,
+     * `du`, `df` and the content readers ask whether the path *leads to* something, which is a
+     * different question from whether the name is a link.
+     *
+     * One hop per call, never one per entry: a tree walk reads its [VStat]s from the listing.
+     */
+    fun statFollowed(vfs: Vfs, path: String): VStat = vfs.stat(vfs.realpath(path))
+
+    /** [statFollowed] as a null, for a caller that treats "cannot be reached" as "is not there". */
+    fun statFollowedOrNull(vfs: Vfs, path: String): VStat? = try {
+        statFollowed(vfs, path)
+    } catch (e: FsException) {
+        null
+    }
+
+    /** `true` when the name exists and leads to a directory, links included, as `cd -P` would see it. */
+    fun isDirFollowed(vfs: Vfs, path: String): Boolean =
+        statFollowedOrNull(vfs, path)?.type == VNodeType.DIRECTORY
+
+    /** The [VStat] of [path], or null when it is absent or this app may not look at it. */
+    fun statOrNull(vfs: Vfs, path: String): VStat? = try {
+        vfs.stat(path)
+    } catch (e: FsException) {
+        null
     }
 
     /** `-` means stdin, the one place a file command does not touch the filesystem. */
     fun openInput(ctx: ExecContext, path: String): InputStream? {
         if (path == "-") return ctx.stdin
         val resolved = resolve(ctx, path) ?: return null
-        val f = File(resolved)
-        if (f.isDirectory) {
-            ctx.errLine("${ctx.name}: $path: Is a directory")
-            return null
-        }
+        // The seam refuses a directory with `Is a directory`, which is the wording this has always
+        // printed for one, so the check does not have to be made here as well.
         return try {
-            FileInputStream(f).buffered()
-        } catch (e: IOException) {
+            ctx.session.vfs.openRead(resolved).buffered()
+        } catch (e: FsException) {
             Errno.report(ctx, ctx.name, path, e)
             null
         }
@@ -144,20 +171,23 @@ object Cmds {
     /**
      * `perms size mtime name`, with no owner and group columns: an app cannot read a file's uid/gid,
      * and inventing a value would be worse than omitting the column. The letters describe what
-     * *this app* can do, which is the only thing the user of this terminal can act on.
+     * *this app* can do, which is the only thing the user of this terminal can act on, so they come
+     * from the [VStat]'s access bits and the group/other columns stay dashes whatever the mode says.
      */
-    fun perms(file: File): String {
+    fun perms(stat: VStat): String {
         val sb = StringBuilder("----------")
-        sb.setCharAt(0, if (file.canRead()) 'r' else '-')
-        sb.setCharAt(1, if (file.canWrite()) 'w' else '-')
-        sb.setCharAt(2, if (file.canExecute()) 'x' else '-')
-        val link = try {
-            java.nio.file.Files.isSymbolicLink(file.toPath())
-        } catch (e: Exception) {
-            false
+        sb.setCharAt(0, if (stat.readable) 'r' else '-')
+        sb.setCharAt(1, if (stat.writable) 'w' else '-')
+        sb.setCharAt(2, if (stat.executable) 'x' else '-')
+        val type = when (stat.type) {
+            VNodeType.SYMLINK -> 'l'
+            VNodeType.DIRECTORY -> 'd'
+            VNodeType.FILE -> '-'
+            else -> '?'
         }
-        val type = if (link) 'l' else if (file.isDirectory) 'd' else if (file.isFile) '-' else '?'
-        return "$type${sb.substring(1)}"
+        // The type character plus all nine permission characters: dropping the first of them
+        // would print the read bit as a dash for every file this app can read.
+        return "$type${sb.substring(0, 9)}"
     }
 
     fun timestamp(millis: Long): String =
@@ -166,12 +196,13 @@ object Cmds {
     fun timestampSec(millis: Long): String =
         SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(millis))
 
-    /** The one-per-line header every column-oriented tool prints, so `| less` is readable. */
-    fun sizeOf(file: File): Long = try {
-        if (file.isDirectory) 4096 else file.length()
-    } catch (e: SecurityException) {
-        0L
-    }
+    /**
+     * The one-per-line header every column-oriented tool prints, so `| less` is readable. A
+     * directory is one 4096-byte block, and a link is measured by its target string: a
+     * [VNodeType.SYMLINK]'s size is the length of the name it points at, where a stat that followed
+     * the link would report the target's own size.
+     */
+    fun sizeOf(stat: VStat): Long = if (stat.type == VNodeType.DIRECTORY) 4096L else stat.size
 
     fun quoteIfNeeded(name: String): String =
         if (name.isEmpty() || name.any { it.isWhitespace() || it == '\'' }) "'${name.replace("'", "'\\''")}'"

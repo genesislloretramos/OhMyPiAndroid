@@ -3,7 +3,6 @@ package omp.shell.cmd
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
 import java.util.Locale
 
 @CommandSpec(
@@ -68,7 +67,7 @@ object Top : FileCommand() {
         sb.append(Cmds.timestampSec(now)).append("  up ")
             .append(upSeconds / 3600).append(':').append((upSeconds % 3600) / 60)
             .append("  load average: unavailable to apps\n")
-        val mem = readMeminfo()
+        val mem = readMeminfo(ctx)
         if (mem != null) {
             val total = mem["MemTotal"] ?: 0
             val avail = mem["MemAvailable"] ?: 0
@@ -85,9 +84,10 @@ object Top : FileCommand() {
         return sb.toString()
     }
 
-    private fun readMeminfo(): Map<String, Long>? = try {
+    /** Through the seam, for the same reason `free` reads it that way: a phone may close it. */
+    private fun readMeminfo(ctx: ExecContext): Map<String, Long>? = try {
         val out = HashMap<String, Long>()
-        for (line in File("/proc/meminfo").readLines()) {
+        for (line in String(ctx.session.vfs.readBytes("/proc/meminfo"), Charsets.UTF_8).lines()) {
             val colon = line.indexOf(':')
             if (colon <= 0) continue
             out[line.substring(0, colon)] = line.substring(colon + 1).trim().split(' ')[0].toLongOrNull() ?: continue

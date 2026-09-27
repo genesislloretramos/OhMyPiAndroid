@@ -25,11 +25,11 @@ object Help : FileCommand() {
     }
 
     private fun listAll(ctx: ExecContext): Int {
-        for ((group, names) in CommandTable.byGroup()) {
+        for ((group, names) in ctx.session.table.byGroup()) {
             ctx.outLine()
             ctx.outLine(capitalize(group) + ":")
             for (name in names) {
-                val synopsis = CommandTable.specOf(name)?.synopsis ?: continue
+                val synopsis = ctx.session.table.specOf(name)?.synopsis ?: continue
                 val tail = when {
                     synopsis.isEmpty() -> ""
                     synopsis.startsWith(ALIAS_PREFIX) -> "  ($synopsis)"
@@ -48,7 +48,7 @@ object Help : FileCommand() {
     }
 
     private fun entry(ctx: ExecContext, topic: String): Int {
-        val spec = CommandTable.specOf(topic) ?: run {
+        val spec = ctx.session.table.specOf(topic) ?: run {
             ctx.errLine("help: no help topics match '$topic'")
             return ExecContext.EXIT_GENERAL_ERROR
         }

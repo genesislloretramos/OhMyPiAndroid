@@ -51,7 +51,7 @@ object Xargs : FileCommand() {
             n
         }
         val command = if (operands.isEmpty()) listOf("echo") else operands
-        val target = CommandTable.lookup(command[0])
+        val target = ctx.session.table.lookup(command[0])
 
         val text = try {
             readAll(ctx) ?: return ExecContext.EXIT_INTERRUPTED

@@ -3,7 +3,8 @@ package omp.shell.cmd
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
+import omp.shell.fs.FsException
+import omp.shell.fs.VNodeType
 
 @CommandSpec(
     name = "readlink",
@@ -23,23 +24,28 @@ object Readlink : FileCommand() {
     ): Int {
         if (operands.isEmpty()) return ctx.fail("readlink: missing operand")
         val canonicalise = 'f' in flags
+        val vfs = ctx.session.vfs
         var status = ExecContext.EXIT_OK
         for (op in operands) {
             val path = Cmds.resolve(ctx, op) ?: run {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val file = File(path)
             if (canonicalise) {
-                if (!fsExists(file)) {
-                    ctx.errLine("readlink: $op: No such file or directory")
+                // -f is the followed-path command: the whole point is the resolved name, links and
+                // all, and a path that does not lead anywhere is the one thing it cannot print.
+                val target = try {
+                    vfs.realpath(path)
+                } catch (e: FsException) {
+                    ctx.errLine("readlink: $op: ${e.errno.text}")
                     status = ExecContext.EXIT_GENERAL_ERROR
                     continue
                 }
-                ctx.outLine(path)
+                ctx.outLine(target)
                 continue
             }
-            val target = if (fsIsLink(file)) fsLinkTarget(file) else null
+            val stat = fsStatOrNull(vfs, path)
+            val target = if (stat?.type == VNodeType.SYMLINK) fsLinkTarget(vfs, path) else null
             if (target == null) {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue

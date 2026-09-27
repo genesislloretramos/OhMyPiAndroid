@@ -4,9 +4,10 @@ import omp.shell.Session
 import omp.shell.exec.Command
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
+import omp.shell.fs.FsException
 import omp.shell.fs.PathException
 import omp.shell.fs.PathResolver
-import java.io.File
+import omp.shell.fs.VNodeType
 
 @CommandSpec(
     name = "test",
@@ -119,15 +120,21 @@ private class Expr(private val session: Session, private val args: List<String>)
         } catch (e: PathException) {
             return false
         }
-        val file = File(resolved)
+        // `test` asks whether the path leads to something: `test -d link` is true for a link to a
+        // directory, and a name that leads nowhere is false for every operator rather than an error.
+        val stat = try {
+            Cmds.statFollowed(session.vfs, resolved)
+        } catch (e: FsException) {
+            return false
+        }
         return when (op) {
-            "-e" -> file.exists()
-            "-f" -> file.isFile
-            "-d" -> file.isDirectory
-            "-r" -> file.canRead()
-            "-w" -> file.canWrite()
-            "-x" -> file.canExecute()
-            else -> file.length() > 0
+            "-e" -> true
+            "-f" -> stat.type == VNodeType.FILE
+            "-d" -> stat.type == VNodeType.DIRECTORY
+            "-r" -> stat.readable
+            "-w" -> stat.writable
+            "-x" -> stat.executable
+            else -> stat.size > 0
         }
     }
 

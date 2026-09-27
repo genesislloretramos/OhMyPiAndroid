@@ -5,10 +5,10 @@ import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
 import omp.shell.exec.printUsage
+import omp.shell.fs.FsException
+import omp.shell.fs.Vfs
 import java.io.BufferedOutputStream
 import java.io.BufferedReader
-import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -48,7 +48,7 @@ object Sed : FileCommand() {
                 errored = true
                 continue
             }
-            if (File(resolved).exists() || scriptTaken) {
+            if (fsExists(ctx.session.vfs, resolved) || scriptTaken) {
                 files += op
             } else {
                 // The first operand that is not an existing file is the script, as GNU sed reads it.
@@ -115,43 +115,54 @@ object Sed : FileCommand() {
         op: String,
     ): Int {
         val resolved = Cmds.resolve(ctx, op) ?: return ExecContext.EXIT_GENERAL_ERROR
-        val target = File(resolved)
-        val temp = File.createTempFile("sed", ".tmp", target.parentFile)
-        val mode = booleanArrayOf(target.canRead(), target.canWrite(), target.canExecute())
+        val vfs = ctx.session.vfs
+        // `sed -i` has always edited the file a link leads to, and the link survived it; keeping
+        // that is the smaller surprise than GNU's habit of replacing the link with a new file.
+        val target = vfs.realpath(resolved)
+        val temp = tempName(vfs, target.substringBeforeLast('/', "/"))
         var status = ExecContext.EXIT_OK
         try {
-            FileOutputStream(temp).use { fos ->
+            vfs.openWrite(temp, false).use { fos ->
                 val out = BufferedOutputStream(fos, 16 * 1024)
                 status = run(ctx, commands, quiet, Cmds.reader(input), out)
                 out.flush()
-                fos.fd.sync()
+                fos.flush()
             }
-        } catch (e: IOException) {
-            temp.delete()
+        } catch (e: FsException) {
+            fsDeleteFile(ctx, "sed", temp, vfs, temp)
             Errno.report(ctx, "sed", op, e)
             return ExecContext.EXIT_GENERAL_ERROR
         } finally {
             if (input !== ctx.stdin) input.close()
         }
         if (status != ExecContext.EXIT_OK) {
-            temp.delete()
+            fsDeleteFile(ctx, "sed", temp, vfs, temp)
             return status
         }
-        temp.setReadable(mode[0], false)
-        temp.setWritable(mode[1], false)
-        temp.setExecutable(mode[2], false)
-        if (!temp.renameTo(target)) {
+        // The rename is what makes this atomic: `run` cannot leave half a file where a real one was.
+        try {
+            vfs.rename(temp, target)
+        } catch (e: FsException) {
+            fsDeleteFile(ctx, "sed", temp, vfs, temp)
             ctx.errLine("sed: could not replace $op")
-            temp.delete()
             return ExecContext.EXIT_GENERAL_ERROR
         }
         return ExecContext.EXIT_OK
     }
 
     /**
-     * A one-line lookahead is what makes the `$` address mean "last line" while still streaming,
-     * and `d` ends the line before `p` or auto-print can see it.
+     * A name no one has taken, in the target's own directory so the rename cannot cross a mount
+     * point. `createTempFile` is not available through the seam, and O_EXCL is what makes a guess
+     * safe: a name that is already there is one this call did not write.
      */
+    private fun tempName(vfs: Vfs, dir: String): String {
+        var salt = 0
+        while (true) {
+            val candidate = "$dir/.sed.${System.nanoTime()}.${salt++}.tmp"
+            if (!fsExists(vfs, candidate)) return candidate
+        }
+    }
+
     private fun run(
         ctx: ExecContext,
         commands: List<Cmd>,

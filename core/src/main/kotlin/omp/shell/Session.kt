@@ -1,14 +1,23 @@
 package omp.shell
 
+import omp.shell.exec.CommandTable
 import omp.shell.exec.JobGroup
+import omp.shell.fs.RealVfs
+import omp.shell.fs.Vfs
 
 /**
  * All state that outlives a single command: environment, aliases, the working directory, job
  * control, the history and the terminal screen. One session per REPL.
+ *
+ * [vfs] is what paths mean here and [table] is what names mean; both default to the phone's own, so
+ * a session that says nothing is exactly the session this shell has always been. A second namespace
+ * is the same [Session] with a different [Vfs] — its `/etc` is not this device's `/etc`.
  */
 class Session(
     val services: PlatformServices,
     val screen: omp.term.Screen,
+    val vfs: Vfs = RealVfs(),
+    val table: CommandTable = CommandTable.global,
 ) {
     val env = LinkedHashMap<String, String>()
     val aliases = LinkedHashMap<String, String>()
@@ -40,6 +49,23 @@ class Session(
     /** `$!`: the pid of the most recently started background job. */
     var lastBackgroundPid: Int = 0
 
+    /**
+     * The channel this session's line editor reads, kept here so a second namespace on the same
+     * terminal can be opened without the caller threading it through: `vm enter` builds the VM's
+     * session from the phone's [input] and the same [omp.term.Screen], and that is what makes the
+     * two sessions one terminal rather than two.
+     *
+     * Null until a [ShellSession] sets it, because a [Session] built directly has no REPL.
+     */
+    var input: InputChannel? = null
+
+    /**
+     * Who is showing this session, when there is a host at all. `vm enter` copies the phone's
+     * [host] into the VM's session so the VM's REPL can say it is in front and hand the terminal
+     * back on the way out. Null on a session that is the only one, which is the app's own.
+     */
+    var host: SessionHost? = null
+
     init {
         env["HOME"] = services.homeDir()
         env["PWD"] = cwd
@@ -61,9 +87,15 @@ class Session(
 
     fun job(pid: Int): JobGroup? = synchronized(jobLock) { jobList.firstOrNull { it.pid == pid } }
 
+    /**
+     * `$HOME`, which the environment owns: `export HOME=…` moves it, and a namespace that is not
+     * this device's brings a home of its own. The platform's home is only the seed.
+     */
+    fun home(): String = env["HOME"] ?: services.homeDir()
+
     /** `$PWD`, for a prompt. */
     fun promptCwd(limit: Int = 40): String {
-        val home = services.homeDir()
+        val home = home()
         val shown = if (cwd == home) "~" else if (cwd.startsWith("$home/")) "~" + cwd.substring(home.length) else cwd
         return if (shown.length <= limit) shown else "…" + shown.takeLast(limit - 1)
     }

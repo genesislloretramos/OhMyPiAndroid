@@ -2,14 +2,11 @@ package omp.shell.cmd
 
 import omp.shell.exec.Command
 import omp.shell.exec.CommandSpec
-import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
-import java.io.File
-import java.io.FileInputStream
-import java.io.IOException
-import java.nio.file.Files
-import java.nio.file.LinkOption
-import java.nio.file.attribute.BasicFileAttributes
+import omp.shell.fs.FsException
+import omp.shell.fs.VNodeType
+import omp.shell.fs.VStat
+import omp.shell.fs.Vfs
 
 @CommandSpec(
     name = "file",
@@ -29,32 +26,26 @@ object FileCmd : Command {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val file = File(path)
-            val attrs = try {
-                Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
-            } catch (e: IOException) {
-                ctx.errLine("file: $op: ${Errno.messageFor(e)}")
-                status = ExecContext.EXIT_GENERAL_ERROR
-                continue
-            } catch (e: SecurityException) {
-                ctx.errLine("file: $op: Permission denied")
+            val stat = fsStatOrNull(ctx.session.vfs, path)
+            if (stat == null) {
+                ctx.errLine("file: $op: No such file or directory")
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            ctx.outLine("$op: ${describe(file, attrs)}")
+            ctx.outLine("$op: ${describe(ctx.session.vfs, path, stat)}")
         }
         return status
     }
 
-    private fun describe(file: File, attrs: BasicFileAttributes): String {
-        if (attrs.isDirectory) return "directory"
-        if (attrs.isSymbolicLink) {
-            val target = fsLinkTarget(file) ?: "unknown"
+    private fun describe(vfs: Vfs, path: String, stat: VStat): String {
+        if (stat.type == VNodeType.DIRECTORY) return "directory"
+        if (stat.type == VNodeType.SYMLINK) {
+            val target = fsLinkTarget(vfs, path) ?: "unknown"
             return "symbolic link to $target"
         }
-        if (attrs.size() == 0L) return "empty"
-        val head = readHead(file) ?: return "data"
-        val extName = extensionOf(file.name)
+        if (stat.size == 0L) return "empty"
+        val head = readHead(vfs, path) ?: return "data"
+        val extName = extensionOf(fsName(path))
         val byName = if (extName != null) byExtension(extName) else null
         // The magic byte decides the family; the extension only refines it. Guessing from the name
         // first would claim a type the bytes do not support.
@@ -62,11 +53,11 @@ object FileCmd : Command {
         val base = if (sniffed != null) refine(sniffed, extName) else null
         if (base != null) return base
         if (byName != null) return byName
-        return textKind(head, file) ?: "data"
+        return textKind(head, stat) ?: "data"
     }
 
-    private fun readHead(file: File): ByteArray? = try {
-        FileInputStream(file).use { input ->
+    private fun readHead(vfs: Vfs, path: String): ByteArray? = try {
+        vfs.openRead(path).use { input ->
             val buf = ByteArray(SNIFF)
             var read = 0
             while (read < SNIFF) {
@@ -76,7 +67,7 @@ object FileCmd : Command {
             }
             if (read <= 0) ByteArray(0) else buf.copyOf(read)
         }
-    } catch (e: IOException) {
+    } catch (e: FsException) {
         null
     } catch (e: SecurityException) {
         null
@@ -178,7 +169,7 @@ object FileCmd : Command {
         else -> null
     }
 
-    private fun textKind(head: ByteArray, file: File): String? {
+    private fun textKind(head: ByteArray, stat: VStat): String? {
         var ascii = true
         for (b in head) {
             val v = b.toInt() and 0xFF
@@ -193,7 +184,7 @@ object FileCmd : Command {
             isValidUtf8(head) -> "Unicode text, UTF-8 text"
             else -> null
         } ?: return null
-        return if (file.canExecute()) "$kind executable" else kind
+        return if (stat.executable) "$kind executable" else kind
     }
 
     /** Decodes only a complete prefix, so a code point cut in half by the sniff window is not a claim. */

@@ -5,11 +5,6 @@ import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
 import omp.shell.fs.PathResolver
-import java.io.File
-import java.io.IOException
-import java.nio.file.Files
-import java.nio.file.LinkOption
-import java.nio.file.Paths
 
 @CommandSpec(
     name = "ln",
@@ -37,17 +32,18 @@ object Ln : FileCommand() {
         val target = PathResolver.expandTilde(ctx.session, targetRaw)
         if (target.isEmpty()) return ctx.fail("ln: $targetRaw: No such file or directory")
         val linkPath = Cmds.resolve(ctx, linkRaw) ?: return ExecContext.EXIT_GENERAL_ERROR
-        val link = File(linkPath)
-        if (Files.exists(link.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+        val vfs = ctx.session.vfs
+        // `stat` does not follow a link, so a dangling one is a name that is already taken.
+        if (fsExists(vfs, linkPath)) {
             return ctx.fail("ln: $linkRaw: File exists")
         }
         return try {
-            Files.createSymbolicLink(link.toPath(), Paths.get(target))
+            vfs.symlink(target, linkPath)
             ExecContext.EXIT_OK
-        } catch (e: IOException) {
-            Errno.report(ctx, "ln", linkRaw, e)
         } catch (e: SecurityException) {
             ctx.fail("ln: $linkRaw: Permission denied")
+        } catch (e: java.io.IOException) {
+            Errno.report(ctx, "ln", linkRaw, e)
         }
     }
 }

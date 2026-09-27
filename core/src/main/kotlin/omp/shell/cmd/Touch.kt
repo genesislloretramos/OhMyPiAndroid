@@ -1,11 +1,9 @@
 package omp.shell.cmd
 
 import omp.shell.exec.CommandSpec
-import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
-import java.io.IOException
+import omp.shell.fs.FsException
 
 @CommandSpec(
     name = "touch",
@@ -26,19 +24,21 @@ object Touch : FileCommand() {
         if (operands.isEmpty()) return ctx.fail("touch: missing operand")
         val noCreate = 'c' in flags
         val now = System.currentTimeMillis()
+        val vfs = ctx.session.vfs
         var status = ExecContext.EXIT_OK
         for (op in operands) {
             val path = Cmds.resolve(ctx, op) ?: run {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val file = File(path)
-            if (!fsExists(file)) {
+            if (!fsExists(vfs, path)) {
                 if (noCreate) continue
-                val created = try {
-                    file.createNewFile()
-                } catch (e: IOException) {
-                    ctx.errLine("touch: $op: ${Errno.messageFor(e)}")
+                // O_CREAT|O_EXCL, so a name that appeared between the two answers as `File exists`
+                // and a path with nowhere to put it as the reason the seam could not create it.
+                try {
+                    vfs.createFile(path)
+                } catch (e: FsException) {
+                    ctx.errLine("touch: $op: ${e.errno.text}")
                     status = ExecContext.EXIT_GENERAL_ERROR
                     continue
                 } catch (e: SecurityException) {
@@ -46,14 +46,14 @@ object Touch : FileCommand() {
                     status = ExecContext.EXIT_GENERAL_ERROR
                     continue
                 }
-                if (!created) {
-                    ctx.errLine("touch: $op: File exists")
-                    status = ExecContext.EXIT_GENERAL_ERROR
-                }
                 continue
             }
+            // The name exists; the timestamp belongs to whatever it leads to, as `touch` always has.
             val touched = try {
-                file.setLastModified(now)
+                vfs.setModified(vfs.realpath(path), now)
+                true
+            } catch (e: FsException) {
+                false
             } catch (e: SecurityException) {
                 false
             }

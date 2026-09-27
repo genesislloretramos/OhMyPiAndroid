@@ -20,6 +20,8 @@ import android.widget.Toast
 import com.omp.terminal.android.AndroidCommands
 import com.omp.terminal.android.AndroidPlatformServices
 import omp.shell.InputChannel
+import omp.shell.Session
+import omp.shell.SessionHost
 import omp.shell.ShellSession
 import omp.term.Screen
 
@@ -27,7 +29,33 @@ import omp.term.Screen
  * The single Activity. It owns the shell thread and the session; the terminal view only ever reads
  * a snapshot of the screen, so there is exactly one writer and one reader.
  */
-class MainActivity : Activity(), ExtraKeysView.Listener {
+class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
+
+    /**
+     * The session the user is talking to: the phone's own until `vm enter` says otherwise.
+     *
+     * One deep, and that is the whole stack. The VM's REPL runs on this same thread over this same
+     * [Screen] and [InputChannel], so while it is up the Back button and the repaint have to
+     * follow *it* rather than the session underneath. The pushed session is what a
+     * [SessionHost] call hands us; null means the phone's shell is in front, which is both the
+     * start state and the state every pop returns to.
+     *
+     * A nullable field rather than `var active = shell.session`: [shell] is a `lateinit` assigned
+     * in `onCreate`, and a property initializer that reads it would run before that and throw on
+     * every launch. Volatile because the shell thread writes it and the main thread reads it.
+     */
+    @Volatile
+    private var pushed: Session? = null
+
+    private val active: Session get() = pushed ?: shell.session
+
+    override fun sessionPushed(session: Session) {
+        pushed = session
+    }
+
+    override fun sessionPopped(session: Session) {
+        pushed = null
+    }
 
     private lateinit var screen: Screen
     private lateinit var input: InputChannel
@@ -46,7 +74,7 @@ class MainActivity : Activity(), ExtraKeysView.Listener {
         super.onCreate(savedInstanceState)
 
         services = AndroidPlatformServices(applicationContext, this)
-        AndroidCommands.register(omp.shell.exec.CommandTable)
+        AndroidCommands.register(omp.shell.exec.CommandTable.global)
 
         val cellHeight = services.prefInt(PREF_CELL_HEIGHT, 0)
         val scrollback = services.prefInt(PREF_SCROLLBACK, DEFAULT_SCROLLBACK)
@@ -77,6 +105,9 @@ class MainActivity : Activity(), ExtraKeysView.Listener {
 
         input = InputChannel()
         shell = ShellSession(services, screen, input)
+        // The root session is also the session the host hands back when a nested one pops, so it is
+        // what `active` starts as and what the double-tap-to-exit is measured against.
+        shell.session.host = this
         services.titleListener = { title -> ui.post { window.setTitle(title) } }
 
         wireIme()
@@ -179,7 +210,10 @@ class MainActivity : Activity(), ExtraKeysView.Listener {
     override fun onResume() {
         super.onResume()
         goImmersive()
-        shell.session.screen.markAllDirty()
+        // Whichever session is in front owns the screen — the Screen is shared, so this is the one
+        // repaint that has to happen on the way back, whether the user was in the phone's shell or
+        // in the VM.
+        active.screen.markAllDirty()
         if (!services.isExternalStorageManager()) flashStatus("all-files access not granted: run grant-storage")
     }
 
@@ -191,10 +225,22 @@ class MainActivity : Activity(), ExtraKeysView.Listener {
     // ---- back ----------------------------------------------------------------------------
 
     override fun onBackPressed() {
-        val job = shell.session.foreground
+        // The session in front, not the phone's: a job running inside the VM is the job Back means.
+        val job = active.foreground
         if (job != null) {
             job.cancel()
             flashStatus("interrupted")
+            return
+        }
+        // One level of nesting, so one level of Back: `exit` in the VM ends its REPL, which pops it
+        // and puts the phone shell back in front. It must not reach the app's own exit path, or
+        // leaving the VM would close the terminal.
+        if (active !== shell.session) {
+            // The flag is enough: the REPL's line editor polls `exitRequested` while it waits for a
+            // key and ends the loop itself. Feeding a Ctrl-D as well used to land in `deleteForward`
+            // whenever the line was not empty, so Back ate a character and went nowhere.
+            active.exitRequested = true
+            flashStatus("leaving the vm")
             return
         }
         val now = System.currentTimeMillis()
@@ -244,6 +290,8 @@ class MainActivity : Activity(), ExtraKeysView.Listener {
 
     private val poll = object : Runnable {
         override fun run() {
+            // Only the root session's `exit` means "close the app". A nested one that exits is a
+            // user leaving the VM, and finishing here would drop them out of the terminal entirely.
             if (shell.session.exitRequested) {
                 finish()
                 return
@@ -279,5 +327,6 @@ class MainActivity : Activity(), ExtraKeysView.Listener {
         const val PREF_THEME = "theme"
         const val DEFAULT_SCROLLBACK = 2000
         private const val FRAME_MS = 16L
+
     }
 }

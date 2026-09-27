@@ -5,7 +5,10 @@ import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
 import omp.shell.exec.printUsage
-import java.io.File
+import omp.shell.fs.FsException
+import omp.shell.fs.VNodeType
+import omp.shell.fs.Vfs
+import omp.shell.fs.resolveSymlinks
 import java.io.IOException
 import java.io.InputStream
 import java.util.regex.Matcher
@@ -79,12 +82,15 @@ object Grep : FileCommand() {
             // No file operand: grep reads standard input, which is what `cmd | grep` produces.
             targets += Target("(standard input)", "-")
         }
+        val vfs = ctx.session.vfs
         for (op in files) {
             if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
             val resolved = Cmds.resolve(ctx, op) ?: run { errored = true; continue }
-            val file = File(resolved)
-            if ('r' in flags && file.isDirectory) {
-                if (!walk(ctx, op, file, include, targets, HashSet())) errored = true
+            // `grep -r` dereferences a command-line operand, and always did here; links met inside
+            // the recursion are still left alone.
+            val stat = Cmds.statFollowedOrNull(vfs, resolved)
+            if ('r' in flags && stat?.type == VNodeType.DIRECTORY) {
+                if (!walk(ctx, vfs, op, resolved, include, targets, HashSet())) errored = true
             } else {
                 targets += Target(displayName(op), op)
             }
@@ -141,20 +147,23 @@ object Grep : FileCommand() {
     /** Depth-first in name order; a canonical-path set is what stops a symlink cycle. */
     private fun walk(
         ctx: ExecContext,
+        vfs: Vfs,
         root: String,
-        dir: File,
+        dir: String,
         include: Pattern?,
         out: MutableList<Target>,
         seen: MutableSet<String>,
     ): Boolean {
-        if (!seen.add(canonicalOf(dir))) return true
-        val entries = Cmds.listDir(ctx, "grep", dir) ?: return false
+        if (!seen.add(canonicalOf(vfs, dir))) return true
+        val entries = Cmds.listDir(ctx, "grep", vfs, dir) ?: return false
         var ok = true
         for (entry in entries.sortedBy { it.name }) {
             if (ctx.cancelled.get()) return false
-            val display = root + File.separatorChar + entry.name
-            if (entry.isDirectory) {
-                if (!walk(ctx, display, entry, include, out, seen)) ok = false
+            val child = fsChild(dir, entry.name)
+            val display = root + "/" + entry.name
+            // A link to a directory is walked, and the canonical set is what stops that looping.
+            if (fsIsDirFollowing(vfs, child, entry.stat)) {
+                if (!walk(ctx, vfs, display, child, include, out, seen)) ok = false
             } else {
                 if (include != null && !include.matcher(entry.name).matches()) continue
                 out += Target(display, display)
@@ -163,10 +172,10 @@ object Grep : FileCommand() {
         return ok
     }
 
-    private fun canonicalOf(file: File): String = try {
-        file.canonicalPath
-    } catch (e: IOException) {
-        file.absolutePath
+    private fun canonicalOf(vfs: Vfs, path: String): String = try {
+        resolveSymlinks(vfs, path)
+    } catch (e: FsException) {
+        path
     }
 
     /** Only `*` and `?` are wildcards in a --include glob; everything else is literal. */

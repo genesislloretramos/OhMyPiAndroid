@@ -27,7 +27,9 @@ object Md5sum : Command {
         for (op in ctx.args) {
             val input = Cmds.openInput(ctx, op) ?: run { errored = true; continue }
             var complete = true
-            val cancelled = try {
+            // `feed` answers "it finished", so this is `finished` and not `cancelled`: reading the
+            // result the other way round made every file operand exit 130 having printed nothing.
+            val finished = try {
                 feed(ctx, input, digest)
             } catch (e: IOException) {
                 Errno.report(ctx, "md5sum", op, e)
@@ -38,7 +40,7 @@ object Md5sum : Command {
             } finally {
                 if (input !== ctx.stdin) input.close()
             }
-            if (cancelled) return ExecContext.EXIT_INTERRUPTED
+            if (!finished) return ExecContext.EXIT_INTERRUPTED
             if (complete) ctx.outLine(hex(digest.digest()) + "  " + op)
         }
         return if (errored) ExecContext.EXIT_GENERAL_ERROR else ExecContext.EXIT_OK

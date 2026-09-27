@@ -1,6 +1,7 @@
 package omp.shell.parser
 
 import omp.shell.Session
+import omp.shell.cmd.fsStatOrNull
 import omp.shell.fs.PathResolver
 
 /** A run of characters that is either protected from splitting/globbing or not. */
@@ -56,8 +57,9 @@ class Expander(
         val head = if (slash < 0) first.text else first.text.substring(0, slash)
         val rest = if (slash < 0) "" else first.text.substring(slash)
         val replacement = when (head) {
-            "~" -> session.services.homeDir()
-            "~+" -> session.oldPwd
+            // The session's `$HOME`, not the platform's: a namespace with a home of its own expands
+            // `~` to it, and `export HOME=…` is a thing a user can type.
+            "~" -> session.home()
             else -> return word
         }
         val segments = ArrayList<Segment>()
@@ -309,7 +311,7 @@ class Expander(
         if (text.isEmpty()) return emptyList()
         if (flat.quoted.any { it }) return listOf(text)
         if (!Glob.hasMagic(text)) return listOf(text)
-        val matches = Glob.expand(text, session.cwd)
+        val matches = Glob.expand(session.vfs, text, session.cwd)
         if (matches.isNullOrEmpty()) return listOf(text)
         val cwd = session.cwd.trimEnd('/') + "/"
         if (text.startsWith("/")) return matches
@@ -322,7 +324,7 @@ class Expander(
         for (dir in (session.env["PATH"] ?: "").split(':')) {
             if (dir.isEmpty()) continue
             val candidate = PathResolver.normalize(dir.trimEnd('/') + "/" + name)
-            if (java.io.File(candidate).canExecute()) return candidate
+            if (fsStatOrNull(session.vfs, candidate)?.executable == true) return candidate
         }
         return null
     }

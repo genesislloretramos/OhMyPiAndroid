@@ -4,16 +4,18 @@ import omp.shell.exec.CommandSpec
 import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
+import omp.shell.fs.FsErrno
+import omp.shell.fs.FsException
 import omp.shell.fs.PathResolver
-import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
+import omp.shell.fs.VNodeType
+import omp.shell.fs.VStat
+import omp.shell.fs.Vfs
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.zip.Deflater
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 @CommandSpec(
@@ -26,6 +28,9 @@ object Zip : FileCommand() {
 
     override val flagSpec = "r"
 
+    /** Where an entry's bytes come from, and whether the entry is a directory that carries none. */
+    private class Source(val path: String, val isDir: Boolean)
+
     override fun execute(
         ctx: ExecContext,
         flags: String,
@@ -35,10 +40,10 @@ object Zip : FileCommand() {
         if (operands.size < 2) return ctx.fail("zip: missing files to add")
         val archiveRaw = operands.first()
         val archivePath = Cmds.resolve(ctx, archiveRaw) ?: return ExecContext.EXIT_GENERAL_ERROR
-        val archive = File(archivePath)
+        val vfs = ctx.session.vfs
         val recursive = 'r' in flags
 
-        val entries = LinkedHashMap<String, File>()
+        val entries = LinkedHashMap<String, Source>()
         var status = ExecContext.EXIT_OK
         for (src in operands.drop(1)) {
             if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
@@ -47,52 +52,63 @@ object Zip : FileCommand() {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val file = File(path)
-            if (!file.exists()) {
+            val stat = Cmds.statFollowedOrNull(vfs, path)
+            if (stat == null) {
                 ctx.errLine("zip: $src: No such file or directory")
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            if (file.isDirectory) {
+            if (stat.type == VNodeType.DIRECTORY) {
                 if (!recursive) {
                     ctx.errLine("zip: $src: Is a directory")
                     status = ExecContext.EXIT_GENERAL_ERROR
                     continue
                 }
-                if (!collect(file, shown, entries, ctx)) status = ExecContext.EXIT_GENERAL_ERROR
+                if (!collect(vfs, path, stat, shown, entries, ctx)) status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
             val name = entryName(ctx, shown) ?: run {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            entries[name] = file
+            entries[name] = Source(path, false)
         }
         if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
         if (entries.isEmpty()) {
             return if (status == ExecContext.EXIT_OK) ctx.fail("zip: nothing to add") else status
         }
-        return write(ctx, archive, archiveRaw, entries, status)
+        return write(ctx, vfs, archivePath, archiveRaw, entries, status)
     }
 
-    /** @return false when a directory in the tree could not be read. */
+    /**
+     * The tree under [path], in listing order, with the names the user typed rather than the ones
+     * the resolver produced. A link to a directory is descended into, which is what this has always
+     * done; the bytes themselves are only read once the whole set of names is known.
+     *
+     * @return false when a directory in the tree could not be read.
+     */
     private fun collect(
-        dir: File,
+        vfs: Vfs,
+        path: String,
+        stat: VStat,
         display: String,
-        out: MutableMap<String, File>,
+        out: MutableMap<String, Source>,
         ctx: ExecContext,
     ): Boolean {
-        val entries = Cmds.listDir(ctx, "zip", dir) ?: return false
+        val entries = Cmds.listDir(ctx, "zip", vfs, path) ?: return false
         val name = entryName(ctx, display.trimEnd('/') + "/") ?: return false
-        out[name] = dir
+        out[name] = Source(path, true)
         for (entry in entries.sortedBy { it.name }) {
             if (ctx.cancelled.get()) return false
             val child = display.trimEnd('/') + "/" + entry.name
-            if (entry.isDirectory) {
-                if (!collect(entry, child, out, ctx)) return false
+            val childPath = fsChild(path, entry.name)
+            val isDir = if (entry.stat.type == VNodeType.SYMLINK) fsIsDirFollowing(vfs, childPath, entry.stat)
+            else entry.stat.type == VNodeType.DIRECTORY
+            if (isDir) {
+                if (!collect(vfs, childPath, entry.stat, child, out, ctx)) return false
             } else {
                 val entryName = entryName(ctx, child) ?: return false
-                out[entryName] = entry
+                out[entryName] = Source(childPath, false)
             }
         }
         return true
@@ -110,79 +126,71 @@ object Zip : FileCommand() {
 
     private fun write(
         ctx: ExecContext,
-        archive: File,
+        vfs: Vfs,
+        archive: String,
         archiveRaw: String,
-        entries: Map<String, File>,
+        entries: Map<String, Source>,
         status: Int,
     ): Int {
-        val parent = archive.parentFile ?: File(".")
-        if (!parent.isDirectory) return Errno.report(ctx, "zip", archiveRaw, IOException("No such file or directory"))
-        val temp = File(parent, archive.name + ".tmp")
+        val parent = archive.substringBeforeLast('/', "/")
+        if (fsStatOrNull(vfs, parent)?.type != VNodeType.DIRECTORY) {
+            return Errno.report(ctx, "zip", archiveRaw, FsException(FsErrno.NO_SUCH_FILE, archiveRaw))
+        }
+        // The archive is built in memory and written once: the seam is the only thing that may put
+        // bytes where the user asked for them, and a half-written archive is worse than none.
+        val buffer = ByteArrayOutputStream()
         try {
-            ZipOutputStream(FileOutputStream(temp)).use { out ->
+            ZipOutputStream(buffer).use { out ->
                 out.setLevel(Deflater.DEFAULT_COMPRESSION)
-                if (archive.isFile) {
-                    val copied = keepExisting(archive, out, entries.keys, ctx, archiveRaw)
-                    if (!copied) {
-                        temp.delete()
+                if (fsStatOrNull(vfs, archive)?.type == VNodeType.FILE) {
+                    if (!keepExisting(vfs, archive, out, entries.keys, ctx, archiveRaw)) {
                         return ExecContext.EXIT_GENERAL_ERROR
                     }
                 }
-                for ((name, file) in entries) {
+                for ((name, source) in entries) {
                     if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
                     out.putNextEntry(ZipEntry(name))
                     // A directory entry carries no bytes; its name is what ends in the separator.
-                    if (!file.isDirectory) {
-                        FileInputStream(file).use { input -> input.copyTo(out) }
-                    }
+                    if (!source.isDir) out.write(vfs.readBytes(source.path))
                     out.closeEntry()
                     ctx.outLine("  adding: $name")
                 }
             }
-        } catch (e: IOException) {
-            temp.delete()
+        } catch (e: FsException) {
             return Errno.report(ctx, "zip", archiveRaw, e)
         } catch (e: SecurityException) {
-            temp.delete()
             return ctx.fail("zip: $archiveRaw: Permission denied")
+        } catch (e: IOException) {
+            return Errno.report(ctx, "zip", archiveRaw, e)
         }
         return try {
-            Files.move(temp.toPath(), archive.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            vfs.writeBytes(archive, buffer.toByteArray())
             status
-        } catch (e: IOException) {
-            // A rename across a mount point is not available; a plain copy of the archive is.
-            try {
-                Files.copy(temp.toPath(), archive.toPath(), StandardCopyOption.REPLACE_EXISTING)
-                temp.delete()
-                status
-            } catch (copyError: IOException) {
-                temp.delete()
-                Errno.report(ctx, "zip", archiveRaw, copyError)
-            }
+        } catch (e: FsException) {
+            Errno.report(ctx, "zip", archiveRaw, e)
+        } catch (e: SecurityException) {
+            ctx.fail("zip: $archiveRaw: Permission denied")
         }
     }
 
     /** Copies the entries the new run does not replace, so `zip` updates rather than truncates. */
     private fun keepExisting(
-        archive: File,
+        vfs: Vfs,
+        archive: String,
         out: ZipOutputStream,
         replaced: kotlin.collections.Set<String>,
         ctx: ExecContext,
         archiveRaw: String,
     ): Boolean = try {
-        ZipFile(archive).use { old ->
-            val entries = old.entries()
-            while (entries.hasMoreElements()) {
-                val entry = entries.nextElement()
-                if (entry.name in replaced) continue
-                if (entry.isDirectory) {
+        ZipInputStream(ByteArrayInputStream(vfs.readBytes(archive))).use { old ->
+            var entry: ZipEntry? = old.nextEntry
+            while (entry != null) {
+                if (entry.name !in replaced) {
                     out.putNextEntry(ZipEntry(entry.name))
+                    if (!entry.isDirectory) old.copyTo(out)
                     out.closeEntry()
-                    continue
                 }
-                out.putNextEntry(ZipEntry(entry.name))
-                old.getInputStream(entry).use { it.copyTo(out) }
-                out.closeEntry()
+                entry = old.nextEntry
             }
         }
         true

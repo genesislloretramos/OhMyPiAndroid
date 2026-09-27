@@ -11,6 +11,12 @@ private const val CSI_DOWN = "${CSI}1B"
 /** [nextKey] reports end of input with this, which no real key can collide with. */
 private const val NO_KEY = -1
 
+/**
+ * How long the editor waits for a key before looking at the world again. Long enough that an idle
+ * prompt costs nothing, short enough that Back out of a pushed session feels immediate.
+ */
+private const val EXIT_POLL_MS = 100L
+
 /** Decoded keys. Printable characters arrive as their code point; control keys are negative. */
 object Key {
     const val UP = -101
@@ -90,6 +96,25 @@ class LineEditor(
                 decodeAvailable()
                 return if (keys.isNotEmpty()) keys.removeAt(0) else -1
             }
+            bytes.add(b.toByte())
+        }
+    }
+
+    /**
+     * A key, or null when none arrived within [timeoutMs]. Same decoding as [nextKey], but the wait
+     * is a poll so the caller's loop can look at state the rest of the app changes behind it.
+     */
+    private fun nextKeyWithin(timeoutMs: Long): Int? {
+        while (true) {
+            decodeAvailable()
+            if (keys.isNotEmpty()) return keys.removeAt(0)
+            val b = input.pollByte(timeoutMs)
+            if (b == null) return null
+            if (b < 0) {
+                decodeAvailable()
+                return if (keys.isNotEmpty()) keys.removeAt(0) else -1
+            }
+            // A key that is still arriving loops round and waits for the rest, as nextKey does.
             bytes.add(b.toByte())
         }
     }
@@ -213,7 +238,12 @@ class LineEditor(
         lastRow = anchorRow
         render(prompt)
         while (true) {
-            val k = nextKey()
+            // A poll, not a blocking read: `exitRequested` is set from another thread when a pushed
+            // session is popped, and a blocked editor would wait for a key that never arrives.
+            val k = nextKeyWithin(EXIT_POLL_MS) ?: run {
+                if (session.exitRequested) return ReadResult.Eof
+                continue
+            }
             if (k == NO_KEY) return ReadResult.Eof
             if (k == Key.CTRL_C) {
                 screen.write("^C\r\n")
@@ -509,7 +539,7 @@ class LineEditor(
             return Pair(pathCandidates(path), "")
         }
         if (raw.contains('/')) return Pair(pathCandidates(path), "")
-        val names = (CommandTable.names() + session.aliases.keys).distinct().sorted()
+        val names = (session.table.names() + session.aliases.keys).distinct().sorted()
         val matches = names.filter { it.startsWith(path) && it.length > path.length }
         return Pair(if (matches.isEmpty()) emptyList() else matches, " ")
     }
@@ -518,10 +548,9 @@ class LineEditor(
         val slash = path.lastIndexOf('/')
         val dir = if (slash < 0) session.cwd else if (slash == 0) "/" else path.substring(0, slash)
         val prefix = if (slash < 0) path else path.substring(slash + 1)
-        val file = java.io.File(if (dir.isEmpty()) "/" else dir)
         val entries = try {
-            file.listFiles()
-        } catch (e: SecurityException) {
+            session.vfs.readDir(if (dir.isEmpty()) "/" else dir)
+        } catch (e: omp.shell.fs.FsException) {
             null
         } ?: return emptyList()
         val base = if (dir.endsWith("/")) dir else dir + "/"

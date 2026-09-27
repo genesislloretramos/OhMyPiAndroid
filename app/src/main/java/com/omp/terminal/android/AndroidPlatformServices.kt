@@ -94,6 +94,13 @@ class AndroidPlatformServices(
      */
     override fun homeDir(): String = File(app.filesDir, "home").absolutePath
 
+    /**
+     * Internal storage itself, which `homeDir` is a subdirectory of. The VM's rootfs lives here as
+     * `rootfs/`, so it needs no permission an ordinary app lacks and is readable with
+     * `run-as com.omp.terminal ls files/rootfs`.
+     */
+    override fun appFilesDir(): String = app.filesDir.absolutePath
+
     override fun initialDirectory(): String = homeDir()
 
     override fun externalStorageDir(): String? {

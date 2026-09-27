@@ -15,7 +15,7 @@ object CommandCmd : Command {
     override fun run(ctx: ExecContext): Int {
         val rest = ctx.argv.drop(1)
         if (rest.isEmpty()) return ExecContext.EXIT_OK
-        val target = CommandTable.lookup(rest[0]) ?: return reportUnrunnable(ctx, rest[0])
+        val target = ctx.session.table.lookup(rest[0]) ?: return reportUnrunnable(ctx, rest[0])
         // The child sees its own argv, so the inner command's `name` is the command it runs and a
         // redirect or pipe it sets up is its own business.
         val child = ExecContext(

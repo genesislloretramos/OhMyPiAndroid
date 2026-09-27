@@ -3,7 +3,7 @@ package omp.shell.cmd
 import omp.shell.exec.Command
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
-import java.io.File
+import omp.shell.fs.FsException
 
 @CommandSpec(
     name = "realpath",
@@ -15,18 +15,22 @@ object Realpath : Command {
 
     override fun run(ctx: ExecContext): Int {
         if (ctx.args.isEmpty()) return ctx.fail("realpath: missing operand")
+        val vfs = ctx.session.vfs
         var status = ExecContext.EXIT_OK
         for (op in ctx.args) {
             val path = Cmds.resolve(ctx, op) ?: run {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            if (!File(path).exists()) {
-                ctx.errLine("realpath: $op: No such file or directory")
+            // This is the followed-path command: the resolver is lexical, so the walk is ours.
+            val target = try {
+                vfs.realpath(path)
+            } catch (e: FsException) {
+                ctx.errLine("realpath: $op: ${e.errno.text}")
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            ctx.outLine(path)
+            ctx.outLine(target)
         }
         return status
     }

@@ -4,7 +4,7 @@ import omp.shell.exec.CommandSpec
 import omp.shell.exec.CommandTable
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
+import omp.shell.fs.PathResolver
 
 @CommandSpec(
     name = "env",
@@ -39,7 +39,7 @@ object Env : FileCommand() {
         val commandName = rest[0]
         val childEnv = LinkedHashMap(ctx.env)
         childEnv.putAll(assignments)
-        val target = CommandTable.lookup(commandName)
+        val target = ctx.session.table.lookup(commandName)
         if (target != null) {
             val child = ExecContext(
                 rest, ctx.stdin, ctx.stdout, ctx.stderr, childEnv,
@@ -57,12 +57,16 @@ object Env : FileCommand() {
 /** The executor's own verdict for a name it cannot run, with this command's name in front of it. */
 internal fun reportUnrunnable(ctx: ExecContext, name: String): Int {
     if (name.contains('/')) {
-        val file = File(name)
-        if (!file.exists()) {
+        // A name with a slash is looked up where the shell is, not where the process happens to be:
+        // the two are the same directory everywhere except inside this shell, which is the point.
+        val vfs = ctx.session.vfs
+        val path = PathResolver.normalize(if (name.startsWith("/")) name else ctx.session.cwd.trimEnd('/') + "/" + name)
+        val stat = Cmds.statFollowedOrNull(vfs, path)
+        if (stat == null) {
             ctx.errLine("${ctx.name}: $name: No such file or directory")
             return ExecContext.EXIT_NOT_FOUND
         }
-        if (!file.canExecute()) {
+        if (!stat.executable) {
             ctx.errLine("${ctx.name}: $name: Permission denied")
             return ExecContext.EXIT_NOT_EXECUTABLE
         }

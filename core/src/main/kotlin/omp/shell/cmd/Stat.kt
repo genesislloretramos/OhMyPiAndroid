@@ -2,51 +2,45 @@ package omp.shell.cmd
 
 import omp.shell.exec.Command
 import omp.shell.exec.CommandSpec
-import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
-import java.io.File
-import java.io.IOException
-import java.nio.file.Files
-import java.nio.file.LinkOption
-import java.nio.file.attribute.BasicFileAttributes
+import omp.shell.fs.VNodeType
+import omp.shell.fs.VStat
 
 @CommandSpec(
     name = "stat",
     synopsis = "file ...",
     group = "files",
-    notes = "no uid, gid or inode: an app cannot read them, and a made-up value is worse than a missing column",
+    notes = "lstat: a symbolic link is reported as the link, with its target on a Link line; " +
+        "there is no -L, and no uid, gid or inode because an app cannot read them",
 )
 object Stat : Command {
 
     override fun run(ctx: ExecContext): Int {
         if (ctx.args.isEmpty()) return ctx.fail("stat: missing file operand")
+        val vfs = ctx.session.vfs
         var status = ExecContext.EXIT_OK
         for (op in ctx.args) {
             val path = Cmds.resolve(ctx, op) ?: run {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val file = File(path)
-            val attrs = try {
-                Files.readAttributes(file.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
-            } catch (e: IOException) {
-                ctx.errLine("stat: $op: ${Errno.messageFor(e)}")
-                status = ExecContext.EXIT_GENERAL_ERROR
-                continue
-            } catch (e: SecurityException) {
-                ctx.errLine("stat: $op: Permission denied")
+            val stat = fsStatOrNull(vfs, path)
+            if (stat == null) {
+                ctx.errLine("stat: $op: No such file or directory")
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
             ctx.outLine("  File: $path")
-            ctx.outLine("  Size: ${attrs.size()}")
-            ctx.outLine("  Type: ${typeOf(attrs)}")
-            ctx.outLine("Access: ${Cmds.timestampSec(attrs.lastAccessTime().toMillis())}")
-            ctx.outLine("Modify: ${Cmds.timestampSec(attrs.lastModifiedTime().toMillis())}")
-            ctx.outLine("Change: ${Cmds.timestampSec(attrs.creationTime().toMillis())}")
-            ctx.outLine("  Mode: ${Cmds.perms(file)}")
-            if (attrs.isSymbolicLink) {
-                val target = fsLinkTarget(file)
+            ctx.outLine("  Size: ${stat.size}")
+            ctx.outLine("  Type: ${typeOf(stat)}")
+            // A [VStat] carries one timestamp, the one every other tool here prints, so the access
+            // and change times are the modification time rather than three guesses at one number.
+            ctx.outLine("Access: ${Cmds.timestampSec(stat.mtimeMillis)}")
+            ctx.outLine("Modify: ${Cmds.timestampSec(stat.mtimeMillis)}")
+            ctx.outLine("Change: ${Cmds.timestampSec(stat.mtimeMillis)}")
+            ctx.outLine("  Mode: ${Cmds.perms(stat)}")
+            if (stat.type == VNodeType.SYMLINK) {
+                val target = fsLinkTarget(vfs, path)
                 if (target != null) ctx.outLine("  Link: $target")
             }
             ctx.outLine()
@@ -54,11 +48,11 @@ object Stat : Command {
         return status
     }
 
-    private fun typeOf(attrs: BasicFileAttributes): String = when {
-        attrs.isSymbolicLink -> "symbolic link"
-        attrs.isDirectory -> "directory"
-        attrs.isRegularFile -> "regular file"
-        // A device node, a fifo or a socket: java.io cannot tell which, so it is not claimed.
+    private fun typeOf(stat: VStat): String = when (stat.type) {
+        VNodeType.SYMLINK -> "symbolic link"
+        VNodeType.DIRECTORY -> "directory"
+        VNodeType.FILE -> "regular file"
+        // A device node, a fifo or a socket: the seam does not say which, so it is not claimed.
         else -> "special file"
     }
 }

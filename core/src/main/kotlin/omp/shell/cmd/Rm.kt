@@ -3,7 +3,7 @@ package omp.shell.cmd
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
+import omp.shell.fs.VNodeType
 
 @CommandSpec(
     name = "rm",
@@ -24,6 +24,7 @@ object Rm : FileCommand() {
         if (operands.isEmpty()) return ctx.fail("rm: missing operand")
         val recursive = 'r' in flags
         val force = 'f' in flags
+        val vfs = ctx.session.vfs
         var status = ExecContext.EXIT_OK
         for (op in operands) {
             if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
@@ -31,8 +32,8 @@ object Rm : FileCommand() {
                 if (!force) status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val file = File(path)
-            if (!fsExists(file)) {
+            val stat = fsStatOrNull(vfs, path)
+            if (stat == null) {
                 // -f silences a missing operand, not a failure to remove something that is there.
                 if (!force) {
                     ctx.errLine("rm: $op: No such file or directory")
@@ -40,15 +41,16 @@ object Rm : FileCommand() {
                 }
                 continue
             }
-            val link = fsIsLink(file)
-            if (file.isDirectory && !link) {
+            // The name, not the target: `rm link` unlinks a link, and only a real directory needs
+            // `-r`. The resolver is lexical precisely so that this command can tell the difference.
+            if (stat.type == VNodeType.DIRECTORY) {
                 if (!recursive) {
                     ctx.errLine("rm: $op: Is a directory")
                     status = ExecContext.EXIT_GENERAL_ERROR
                     continue
                 }
-                if (!fsDeleteTree(ctx, "rm", file, ctx.cancelled)) status = ExecContext.EXIT_GENERAL_ERROR
-            } else if (!fsDeleteFile(ctx, "rm", op, file)) {
+                if (!fsDeleteTree(ctx, "rm", vfs, path, ctx.cancelled)) status = ExecContext.EXIT_GENERAL_ERROR
+            } else if (!fsDeleteFile(ctx, "rm", op, vfs, path)) {
                 status = ExecContext.EXIT_GENERAL_ERROR
             }
         }

@@ -1,6 +1,9 @@
 package omp.shell.parser
 
-import java.io.File
+import omp.shell.fs.FsException
+import omp.shell.fs.VEntry
+import omp.shell.fs.VNodeType
+import omp.shell.fs.Vfs
 
 /**
  * Pathname expansion. `*`, `?`, `[...]` with ranges, and `**` which is recursive only when it is a
@@ -24,18 +27,18 @@ object Glob {
      * @return sorted matches, or null when [pattern] holds no magic. An empty list means the
      *   pattern had magic but matched nothing, and the caller keeps the pattern literal.
      */
-    fun expand(pattern: String, cwd: String): List<String>? {
+    fun expand(vfs: Vfs, pattern: String, cwd: String): List<String>? {
         if (!hasMagic(pattern)) return null
         val absolute = pattern.startsWith("/")
         val segs = pattern.split('/').filter { it.isNotEmpty() }
         val base = if (absolute) "/" else cwd
         val results = ArrayList<String>()
-        walk(base, segs, 0, results, absolute)
+        walk(vfs, base, segs, 0, results)
         results.sort()
         return results
     }
 
-    private fun walk(dir: String, segs: List<String>, index: Int, out: ArrayList<String>, absolute: Boolean) {
+    private fun walk(vfs: Vfs, dir: String, segs: List<String>, index: Int, out: ArrayList<String>) {
         if (index == segs.size) {
             out += dir
             return
@@ -43,28 +46,44 @@ object Glob {
         val seg = segs[index]
         if (seg == "**") {
             // Zero directories, then any depth.
-            walk(dir, segs, index + 1, out, absolute)
-            for (d in listDir(dir) ?: emptyList()) {
-                if (Files.isDirectory(d)) walk(d.path, segs, index, out, absolute)
+            walk(vfs, dir, segs, index + 1, out)
+            for (d in listDir(vfs, dir) ?: emptyList()) {
+                if (isDirectory(vfs, d, dir)) walk(vfs, child(dir, d.name), segs, index, out)
             }
             return
         }
-        val entries = listDir(dir) ?: return
+        val entries = listDir(vfs, dir) ?: return
         for (e in entries) {
             if (!matchSegment(seg, e.name)) continue
+            val next = child(dir, e.name)
             val last = index == segs.size - 1
             if (last) {
-                out += e.path
-            } else if (Files.isDirectory(e)) {
-                walk(e.path, segs, index + 1, out, absolute)
+                out += next
+            } else if (isDirectory(vfs, e, dir)) {
+                walk(vfs, next, segs, index + 1, out)
             }
         }
     }
 
-    private fun listDir(dir: String): List<File>? = try {
-        File(dir).listFiles()?.toList()
-    } catch (e: SecurityException) {
+    /** A [VEntry] appended to the directory it was listed in, the way a path spells a child. */
+    private fun child(dir: String, name: String): String = dir.trimEnd('/') + "/" + name
+
+    /** The entries in [dir], or null when it may not be listed, which ends the walk. */
+    private fun listDir(vfs: Vfs, dir: String): List<VEntry>? = try {
+        vfs.readDir(dir)
+    } catch (e: FsException) {
         null
+    }
+
+    /** A stat is taken without following a link, and `**` walks what `java.io` called one. */
+    private fun isDirectory(vfs: Vfs, entry: VEntry, dir: String): Boolean = when (entry.stat.type) {
+        VNodeType.DIRECTORY -> true
+        VNodeType.SYMLINK -> try {
+            vfs.stat(vfs.realpath(child(dir, entry.name))).type == VNodeType.DIRECTORY
+        } catch (e: FsException) {
+            false
+        }
+        else -> false
     }
 
     /** Segment matcher for `*`, `?`, `[...]`; a leading `.` must be matched explicitly. */
@@ -164,13 +183,5 @@ object Glob {
     fun matchWhole(pattern: String, text: String): Boolean {
         if (pattern.contains('/')) return pattern == text
         return match(pattern, 0, text, 0)
-    }
-
-    private object Files {
-        fun isDirectory(f: File): Boolean = try {
-            f.isDirectory
-        } catch (e: SecurityException) {
-            false
-        }
     }
 }

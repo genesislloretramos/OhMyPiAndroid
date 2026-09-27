@@ -1,12 +1,10 @@
 package omp.shell.cmd
 
 import omp.shell.exec.CommandSpec
-import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
-import java.io.IOException
-import java.nio.file.Files
+import omp.shell.fs.FsException
+import omp.shell.fs.VNodeType
 
 @CommandSpec(
     name = "cp",
@@ -31,8 +29,9 @@ object Cp : FileCommand() {
         val destRaw = operands.last()
         val sources = operands.dropLast(1)
         val destPath = Cmds.resolve(ctx, destRaw) ?: return ExecContext.EXIT_GENERAL_ERROR
-        val dest = File(destPath)
-        val destIsDir = dest.isDirectory
+        val vfs = ctx.session.vfs
+        val destStat = fsStatOrNull(vfs, destPath)
+        val destIsDir = destStat != null && fsIsDirFollowing(vfs, destPath, destStat)
         if (sources.size > 1 && !destIsDir) {
             return ctx.fail("cp: target '$destRaw' is not a directory")
         }
@@ -44,29 +43,32 @@ object Cp : FileCommand() {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val src = File(srcPath)
-            if (!fsExists(src)) {
+            // `cp` copies what a link leads to; only the name being written to is left alone.
+            val srcStat = Cmds.statFollowedOrNull(vfs, srcPath)
+            if (srcStat == null) {
                 ctx.errLine("cp: $srcRaw: No such file or directory")
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val target = if (destIsDir) File(dest, src.name) else dest
-            val srcIsDir = src.isDirectory
+            val target = if (destIsDir) fsChild(destPath, fsName(srcPath)) else destPath
+            val srcIsDir = srcStat.type == VNodeType.DIRECTORY
             if (srcIsDir) {
                 if (!recursive) {
                     ctx.errLine("cp: -r not specified; omitting directory '$srcRaw'")
                     status = ExecContext.EXIT_GENERAL_ERROR
                     continue
                 }
-                if (fsExists(target) && !target.isDirectory) {
-                    ctx.errLine("cp: cannot overwrite non-directory '${target.path}' with directory")
+                val targetStat = fsStatOrNull(vfs, target)
+                if (targetStat != null && !fsIsDirFollowing(vfs, target, targetStat)) {
+                    ctx.errLine("cp: cannot overwrite non-directory '$target' with directory")
                     status = ExecContext.EXIT_GENERAL_ERROR
                     continue
                 }
                 val failure = try {
-                    if (fsCopyTree(ctx, "cp", src, target, ctx.cancelled)) null else "could not copy the whole tree"
-                } catch (e: IOException) {
-                    Errno.messageFor(e)
+                    if (fsCopyTree(ctx, "cp", vfs, srcPath, target, ctx.cancelled)) null
+                    else "could not copy the whole tree"
+                } catch (e: FsException) {
+                    e.errno.text
                 } catch (e: SecurityException) {
                     "Permission denied"
                 }
@@ -77,14 +79,15 @@ object Cp : FileCommand() {
                 continue
             }
             val fileFailure = try {
-                if (target.isDirectory) {
-                    "target '${target.path}' is a directory"
+                val targetStat = fsStatOrNull(vfs, target)
+                if (targetStat != null && fsIsDirFollowing(vfs, target, targetStat)) {
+                    "target '$target' is a directory"
                 } else {
-                    fsCopyOne(src.toPath(), target.toPath())
+                    fsCopyOne(vfs, srcPath, target)
                     null
                 }
-            } catch (e: IOException) {
-                Errno.messageFor(e)
+            } catch (e: FsException) {
+                e.errno.text
             } catch (e: SecurityException) {
                 "Permission denied"
             }

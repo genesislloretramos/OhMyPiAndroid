@@ -10,6 +10,15 @@ interface PlatformServices {
 
     // ---- environment -------------------------------------------------------------------
 
+    /**
+     * The app's private storage, the directory everything this app writes lives under.
+     *
+     * Always writable, no permission needed; the VM's disk is a subdirectory of it. [homeDir] is
+     * another one, so the phone shell's files and a VM's rootfs cannot collide, and `adb shell
+     * run-as com.omp.terminal ls files/` shows both.
+     */
+    fun appFilesDir(): String
+
     /** `$HOME`; created with a `.profile` on first use. Always writable, no permission needed. */
     fun homeDir(): String
 

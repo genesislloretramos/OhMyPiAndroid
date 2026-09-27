@@ -12,10 +12,8 @@ import omp.shell.parser.Redirect
 import omp.shell.parser.ShellParseException
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import omp.shell.fs.FsException
 import java.io.Closeable
-import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -25,8 +23,11 @@ import java.io.PipedOutputStream
 /**
  * Runs a [Program]. Every pipeline stage is one [Command] invocation on its own daemon thread inside
  * a [JobGroup]; the REPL thread joins the last stage and takes its status.
+ *
+ * [table] is the session's, so a name a second namespace registered is dispatched here and one it
+ * did not is not, even though both tables hold the same stateless command objects.
  */
-class Shell(private val session: Session) {
+class Shell(private val session: Session, val table: CommandTable = CommandTable.global) {
 
     val expander = Expander(session, ::capture)
 
@@ -101,7 +102,11 @@ class Shell(private val session: Session) {
             val stageIn: InputStream = if (i == 0) stdin else pipeIns[i - 1]
             val stageOut: OutputStream = if (last) stdout else pipeOuts[i]
             val t = Thread({
-                group.status = runStage(stages[i], stageIn, stageOut, stderr, tty && last, group)
+                // `last` is a position, not a destination: a command whose own output is
+                // redirected is not writing to the terminal whatever its place in the pipeline is.
+                group.status = runStage(
+                    stages[i], stageIn, stageOut, stderr, tty && last && !redirectsStdout(stages[i]), group,
+                )
                 // Without this the next stage blocks: a PipedInputStream only reports EOF once the
                 // writing end is closed, and it throws "Write end dead" once that thread is gone.
                 if (!last) closeQuietly(stageOut)
@@ -144,6 +149,15 @@ class Shell(private val session: Session) {
         closeQuietly(links)
         return status
     }
+
+    /**
+     * Whether a command sends its own output somewhere other than the pipeline's stdout.
+     *
+     * [omp.shell.parser.Redirect.changesStdout] is the whole decision; this only says it for one
+     * command node, because that is the granularity at which a redirect was typed.
+     */
+    private fun redirectsStdout(node: CommandNode): Boolean =
+        node.redirects.any { it.changesStdout }
 
     private fun runStage(
         node: CommandNode,
@@ -193,7 +207,7 @@ class Shell(private val session: Session) {
         val fds = applyRedirects(node.redirects, stdin, stdout, stderr)
         // A special built-in sees its assignment prefix as operands too, so `export FOO=bar` both
         // reports the name and keeps it, instead of treating the prefix as "no arguments".
-        val registered = CommandTable.lookup(argv[0])
+        val registered = table.lookup(argv[0])
         val effective = if (registered is SessionAssignmentCommand && node.assignments.isNotEmpty()) {
             node.assignments.map { "${it.first}=${env[it.first]}" } + argv
         } else {
@@ -245,7 +259,7 @@ class Shell(private val session: Session) {
 
     private fun dispatch(ctx: ExecContext): Int {
         val name = ctx.argv[0]
-        CommandTable.lookup(name)?.let { return it.run(ctx) }
+        table.lookup(name)?.let { return it.run(ctx) }
         if (name.contains('/')) {
             val path = try {
                 PathResolver.resolve(session, name)
@@ -253,12 +267,13 @@ class Shell(private val session: Session) {
                 ctx.errLine("sh: $name: ${e.message}")
                 return ExecContext.EXIT_NOT_FOUND
             }
-            val file = File(path)
-            if (!file.exists()) {
+            val stat = try {
+                session.vfs.stat(path)
+            } catch (e: FsException) {
                 ctx.errLine("sh: $name: No such file or directory")
                 return ExecContext.EXIT_NOT_FOUND
             }
-            if (!file.canExecute()) {
+            if (!stat.executable) {
                 ctx.errLine("sh: $name: Permission denied")
                 return ExecContext.EXIT_NOT_EXECUTABLE
             }
@@ -320,9 +335,9 @@ class Shell(private val session: Session) {
             }
             try {
                 if (r.fd == 0) {
-                    inS = FileInputStream(path).also { opened += it }
+                    inS = session.vfs.openRead(path).also { opened += it }
                 } else {
-                    val f = FileOutputStream(path, r.append)
+                    val f = session.vfs.openWrite(path, r.append)
                     opened += f
                     if (r.stderrToo) {
                         outS = f

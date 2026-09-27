@@ -2,10 +2,8 @@ package omp.shell.cmd
 
 import omp.shell.Session
 import omp.shell.exec.CommandSpec
-import omp.shell.exec.CommandTable
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
 
 /**
  * The PATH search `type` and `which` share. A name with a slash is looked up directly, as a shell
@@ -13,14 +11,14 @@ import java.io.File
  * wins. There is no `$0`-relative fallback, because this shell runs nothing by relative path.
  */
 internal fun findOnPath(session: Session, name: String): String? {
+    val vfs = session.vfs
     if (name.contains('/')) {
-        val file = File(name)
-        return if (file.isFile && file.canExecute()) file.path else null
+        return if (fsIsExecutableFile(vfs, name)) name else null
     }
     for (dir in (session.env["PATH"] ?: "").split(':')) {
         if (dir.isEmpty()) continue
-        val file = File(dir, name)
-        if (file.isFile && file.canExecute()) return file.path
+        val candidate = dir.trimEnd('/') + "/" + name
+        if (fsIsExecutableFile(vfs, candidate)) return candidate
     }
     return null
 }
@@ -43,5 +41,8 @@ object Which : FileCommand() {
     }
 }
 
-/** A registered command, for `type`; the table is the only authority on what is built in. */
-internal fun isShellCommand(name: String): Boolean = CommandTable.lookup(name) != null
+/**
+ * A registered command, for `type`; the session's table is the only authority on what is built in,
+ * so a namespace that registered its own name answers for itself.
+ */
+internal fun isShellCommand(ctx: ExecContext, name: String): Boolean = ctx.session.table.lookup(name) != null

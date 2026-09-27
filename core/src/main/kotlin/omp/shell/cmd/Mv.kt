@@ -2,13 +2,11 @@ package omp.shell.cmd
 
 import omp.shell.exec.Command
 import omp.shell.exec.CommandSpec
-import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
-import java.io.File
-import java.io.IOException
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
+import omp.shell.fs.FsException
+import omp.shell.fs.VNodeType
+import omp.shell.fs.VStat
+import omp.shell.fs.Vfs
 
 @CommandSpec(
     name = "mv",
@@ -25,8 +23,11 @@ object Mv : Command {
         val destRaw = ctx.args.last()
         val sources = ctx.args.dropLast(1)
         val destPath = Cmds.resolve(ctx, destRaw) ?: return ExecContext.EXIT_GENERAL_ERROR
-        val dest = File(destPath)
-        val destIsDir = dest.isDirectory
+        val vfs = ctx.session.vfs
+        // The destination may be a link to a directory, and writing through it is what a shell
+        // does; the source must not be followed, or `mv link name` would move the target.
+        val destStat = fsStatOrNull(vfs, destPath)
+        val destIsDir = destStat != null && fsIsDirFollowing(vfs, destPath, destStat)
         if (sources.size > 1 && !destIsDir) {
             return ctx.fail("mv: target '$destRaw' is not a directory")
         }
@@ -38,84 +39,91 @@ object Mv : Command {
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val src = File(srcPath)
-            if (!fsExists(src)) {
+            val srcStat = fsStatOrNull(vfs, srcPath)
+            if (srcStat == null) {
                 ctx.errLine("mv: $srcRaw: No such file or directory")
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            val target = if (destIsDir) File(dest, src.name) else dest
-            if (target.path == src.path) continue
-            if (target.parentFile?.path == src.path) {
+            val target = if (destIsDir) fsChild(destPath, fsName(srcPath)) else destPath
+            if (target == srcPath) continue
+            if (target.substringBeforeLast('/', "") == srcPath) {
                 ctx.errLine("mv: cannot move '$srcRaw' to a subdirectory of itself")
                 status = ExecContext.EXIT_GENERAL_ERROR
                 continue
             }
-            if (!moveOne(ctx, src, target, srcRaw)) status = ExecContext.EXIT_GENERAL_ERROR
+            if (!moveOne(ctx, vfs, srcPath, srcStat, target, srcRaw)) status = ExecContext.EXIT_GENERAL_ERROR
         }
         if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
         return status
     }
 
-    private fun moveOne(ctx: ExecContext, src: File, target: File, srcRaw: String): Boolean {
-        if (fsExists(target) && target.isDirectory != src.isDirectory) {
-            val clash = if (src.isDirectory) {
-                "non-directory '${target.path}' with directory"
+    private fun moveOne(
+        ctx: ExecContext,
+        vfs: Vfs,
+        src: String,
+        srcStat: VStat,
+        target: String,
+        srcRaw: String,
+    ): Boolean {
+        val srcIsDir = srcStat.type == VNodeType.DIRECTORY
+        val targetStat = fsStatOrNull(vfs, target)
+        if (targetStat != null && fsIsDirFollowing(vfs, target, targetStat) != srcIsDir) {
+            val clash = if (srcIsDir) {
+                "non-directory '$target' with directory"
             } else {
-                "directory '${target.path}' with non-directory"
+                "directory '$target' with non-directory"
             }
             ctx.errLine("mv: cannot overwrite $clash")
             return false
         }
+        // The seam has one rename, which is the atomic one inside a filesystem; a rename across a
+        // mount point is not available there either, and the copy below takes over.
         try {
-            Files.move(src.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+            vfs.rename(src, target)
             return true
-        } catch (e: AtomicMoveNotSupportedException) {
-            // Either a provider without atomic moves or a different filesystem; the next two cover both.
-        } catch (e: IOException) {
         } catch (e: SecurityException) {
             ctx.errLine("mv: $srcRaw: Permission denied")
             return false
+        } catch (e: FsException) {
         }
-        try {
-            Files.move(src.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            return true
-        } catch (e: IOException) {
-            // A rename across a mount point fails here too, and the copy path below takes over.
-        } catch (e: SecurityException) {
-            ctx.errLine("mv: $srcRaw: Permission denied")
-            return false
-        }
-        return copyThenDelete(ctx, src, target, srcRaw)
+        return copyThenDelete(ctx, vfs, src, srcIsDir, target, srcRaw)
     }
 
-    private fun copyThenDelete(ctx: ExecContext, src: File, target: File, srcRaw: String): Boolean {
+    private fun copyThenDelete(
+        ctx: ExecContext,
+        vfs: Vfs,
+        src: String,
+        srcIsDir: Boolean,
+        target: String,
+        srcRaw: String,
+    ): Boolean {
         val copied = try {
-            if (!src.isDirectory) {
-                fsCopyOne(src.toPath(), target.toPath())
+            if (!srcIsDir) {
+                fsCopyOne(vfs, src, target)
                 true
             } else {
-                fsCopyTree(ctx, "mv", src, target, ctx.cancelled)
+                fsCopyTree(ctx, "mv", vfs, src, target, ctx.cancelled)
             }
-        } catch (e: IOException) {
-            ctx.errLine("mv: $srcRaw: ${Errno.messageFor(e)}")
+        } catch (e: FsException) {
+            ctx.errLine("mv: $srcRaw: ${e.errno.text}")
             return false
         } catch (e: SecurityException) {
             ctx.errLine("mv: $srcRaw: Permission denied")
             return false
         }
         if (!copied) {
-            ctx.errLine("mv: could not copy the whole tree to '${target.path}'")
+            ctx.errLine("mv: could not copy the whole tree to '$target'")
             return false
         }
-        val removed = if (fsIsLink(src) || !src.isDirectory) {
+        val removed = if (!srcIsDir) {
             // Removing a link must not touch whatever it points at.
-            fsDeleteFile(ctx, "mv", srcRaw, src)
+            fsDeleteFile(ctx, "mv", srcRaw, vfs, src)
         } else {
-            fsDeleteTree(ctx, "mv", src, ctx.cancelled)
+            fsDeleteTree(ctx, "mv", vfs, src, ctx.cancelled)
         }
         if (!removed) {
-            ctx.errLine("mv: $srcRaw was copied to '${target.path}' but the source could not be removed")
+            ctx.errLine("mv: $srcRaw was copied to '$target' but the source could not be removed")
             return false
         }
         return true

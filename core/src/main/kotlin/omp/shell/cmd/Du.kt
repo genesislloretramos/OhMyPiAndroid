@@ -3,7 +3,9 @@ package omp.shell.cmd
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
+import omp.shell.fs.VNodeType
+import omp.shell.fs.VStat
+import omp.shell.fs.Vfs
 
 @CommandSpec(
     name = "du",
@@ -24,6 +26,7 @@ object Du : FileCommand() {
         operands: List<String>,
     ): Int {
         if (operands.isEmpty()) return ctx.fail("du: missing operand")
+        val vfs = ctx.session.vfs
         val rawDepth = options["d"] ?: options["max-depth"]
         var maxDepth = Int.MAX_VALUE
         if (rawDepth != null) {
@@ -32,7 +35,7 @@ object Du : FileCommand() {
             maxDepth = v
         }
         if ('s' in flags) maxDepth = 0
-        val walker = Walker(ctx, 'h' in flags, 'a' in flags, maxDepth)
+        val walker = Walker(ctx, vfs, 'h' in flags, 'a' in flags, maxDepth)
 
         for (op in operands) {
             if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
@@ -40,17 +43,19 @@ object Du : FileCommand() {
                 walker.failed = true
                 continue
             }
-            val root = File(path)
-            if (!root.exists()) {
+            // Measured: `du link` has always reported what the link leads to, and that is what
+            // coreutils does with a command-line operand. Entries inside a tree keep their own rule.
+            val root = Cmds.statFollowedOrNull(vfs, path)
+            if (root == null) {
                 ctx.errLine("du: $op: No such file or directory")
                 walker.failed = true
                 continue
             }
-            if (!root.isDirectory) {
+            if (root.type != VNodeType.DIRECTORY) {
                 walker.row(op, Cmds.sizeOf(root))
                 continue
             }
-            walker.visit(root, op, 0, true)
+            walker.visit(path, root, op, 0, true)
             if (walker.cancelled) return ExecContext.EXIT_INTERRUPTED
         }
         return if (walker.failed) ExecContext.EXIT_GENERAL_ERROR else ExecContext.EXIT_OK
@@ -62,6 +67,7 @@ object Du : FileCommand() {
      */
     private class Walker(
         private val ctx: ExecContext,
+        private val vfs: Vfs,
         private val human: Boolean,
         private val all: Boolean,
         private val maxDepth: Int,
@@ -74,18 +80,22 @@ object Du : FileCommand() {
             ctx.outLine("$text\t$display")
         }
 
-        fun visit(file: File, display: String, depth: Int, root: Boolean): Long {
+        fun visit(path: String, stat: VStat, display: String, depth: Int, root: Boolean): Long {
             if (ctx.cancelled.get()) {
                 cancelled = true
                 return 0
             }
-            if (!file.isDirectory) {
-                val size = Cmds.sizeOf(file)
+            // A link to a directory is a directory to `du`, which is what it has always added up:
+            // the block the link sits in, then whatever is inside what it points at.
+            val isDir = if (stat.type == VNodeType.SYMLINK) fsIsDirFollowing(vfs, path, stat)
+            else stat.type == VNodeType.DIRECTORY
+            if (!isDir) {
+                val size = Cmds.sizeOf(stat)
                 if (depth <= maxDepth && (all || root)) row(display, size)
                 return size
             }
-            var total = Cmds.sizeOf(file)
-            val entries = Cmds.listDir(ctx, "du", file)
+            var total = Cmds.sizeOf(stat)
+            val entries = Cmds.listDir(ctx, "du", vfs, path)
             if (entries == null) {
                 failed = true
                 return total
@@ -95,7 +105,7 @@ object Du : FileCommand() {
                     cancelled = true
                     return total
                 }
-                total += visit(entry, display.trimEnd('/') + "/" + entry.name, depth + 1, false)
+                total += visit(fsChild(path, entry.name), entry.stat, display.trimEnd('/') + "/" + entry.name, depth + 1, false)
             }
             if (depth <= maxDepth && (all || root)) row(display, total)
             return total

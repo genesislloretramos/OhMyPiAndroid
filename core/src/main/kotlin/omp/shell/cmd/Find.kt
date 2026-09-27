@@ -6,9 +6,14 @@ import omp.shell.exec.CommandTable
 import omp.shell.exec.Errno
 import omp.shell.exec.ExecContext
 import omp.shell.exec.printUsage
+import omp.shell.fs.FsErrno
+import omp.shell.fs.FsException
 import omp.shell.fs.PathResolver
+import omp.shell.fs.VNodeType
+import omp.shell.fs.VStat
+import omp.shell.fs.Vfs
+import omp.shell.fs.resolveSymlinks
 import omp.shell.parser.Glob
-import java.io.File
 import java.io.IOException
 import java.util.Locale
 
@@ -158,8 +163,10 @@ object Find : Command {
 
         val shown = startRaw ?: "."
         val startPath = Cmds.resolve(ctx, shown) ?: return ExecContext.EXIT_GENERAL_ERROR
-        val start = File(startPath)
-        if (!start.exists()) return ctx.fail("find: '$shown': No such file or directory")
+        val vfs = ctx.session.vfs
+        // `find` does not dereference: `find link -type l` is how a user finds the links.
+        val startStat = fsStatOrNull(vfs, startPath)
+            ?: return ctx.fail("find: '$shown': No such file or directory")
 
         val query = Query(
             name = name,
@@ -176,7 +183,7 @@ object Find : Command {
             follow = follow,
         )
         val display = PathResolver.expandTilde(ctx.session, shown)
-        return walk(ctx, query, start, display, 0, ArrayList(), 0)
+        return walk(ctx, vfs, query, startPath, startStat, display, 0, ArrayList(), 0)
     }
 
     private fun parseSize(text: String): Size? {
@@ -211,112 +218,118 @@ object Find : Command {
      */
     private fun walk(
         ctx: ExecContext,
+        vfs: Vfs,
         q: Query,
-        file: File,
+        path: String,
+        stat: VStat,
         display: String,
         depth: Int,
         ancestors: MutableList<String>,
         hops: Int,
     ): Int {
         if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
-        val link = fsIsLink(file)
+        val link = stat.type == VNodeType.SYMLINK
         if (link && q.follow && hops >= MAX_LINK_HOPS) {
             ctx.errLine("find: $display: Too many levels of symbolic links")
             return ExecContext.EXIT_OK
         }
         val nextHops = if (link && q.follow) hops + 1 else hops
-        val isDir = file.isDirectory && (!link || q.follow)
+        // A stat is taken without following a link, so a followed one has to be asked about again.
+        val isDir = if (link) q.follow && fsIsDirFollowing(vfs, path, stat) else stat.type == VNodeType.DIRECTORY
         if (isDir && q.follow) {
-            val real = realPath(file)
+            val real = realPath(vfs, path)
             if (ancestors.contains(real)) return ExecContext.EXIT_OK
             ancestors.add(real)
         }
 
         if (isDir && depth < q.maxDepth) {
-            val entries = Cmds.listDir(ctx, "find", file)
+            val entries = Cmds.listDir(ctx, "find", vfs, path)
             if (entries != null) {
                 for (entry in entries.sortedBy { it.name }) {
                     val child = display.trimEnd('/') + "/" + entry.name
-                    val rc = walk(ctx, q, entry, child, depth + 1, ancestors, nextHops)
+                    val rc = walk(ctx, vfs, q, fsChild(path, entry.name), entry.stat, child, depth + 1, ancestors, nextHops)
                     if (rc != ExecContext.EXIT_OK) return rc
                 }
             }
         }
         if (isDir && q.follow) ancestors.removeAt(ancestors.size - 1)
 
-        if (!matches(q, file, display, depth)) return ExecContext.EXIT_OK
+        if (!matches(vfs, q, path, stat, display, depth)) return ExecContext.EXIT_OK
         if (q.printAction) ctx.outLine(display)
         if (q.exec != null) {
             if (ctx.cancelled.get()) return ExecContext.EXIT_INTERRUPTED
             val rc = runExec(ctx, q.exec, display)
             if (rc == ExecContext.EXIT_NOT_FOUND) return rc
         }
-        if (q.deleteAction) delete(ctx, file, display, isDir)
+        if (q.deleteAction) delete(ctx, vfs, path, display, isDir)
         return ExecContext.EXIT_OK
     }
 
-    private fun delete(ctx: ExecContext, file: File, display: String, isDir: Boolean) {
+    private fun delete(ctx: ExecContext, vfs: Vfs, path: String, display: String, isDir: Boolean) {
         if (!isDir) {
-            fsDeleteFile(ctx, "find", display, file)
+            fsDeleteFile(ctx, "find", display, vfs, path)
             return
         }
-        val left = try {
-            file.listFiles()
-        } catch (e: SecurityException) {
-            null
+        val occupied = try {
+            vfs.readDir(path).isNotEmpty()
+        } catch (e: FsException) {
+            // An unreadable directory and one that vanished mid-walk are both `Permission denied`
+            // here, which is the wording a `find` that could not see inside it has always used.
+            ctx.errLine("find: $display: ${if (e.errno == FsErrno.PERM_DENIED) e.errno.text else FsErrno.PERM_DENIED.text}")
+            return
         }
-        when {
-            left == null -> ctx.errLine("find: $display: Permission denied")
-            left.isNotEmpty() -> ctx.errLine("find: $display: Directory not empty")
-            else -> fsDeleteFile(ctx, "find", display, file)
+        if (occupied) {
+            ctx.errLine("find: $display: Directory not empty")
+            return
         }
+        fsRmdir(ctx, "find", display, vfs, path)
     }
 
-    private fun realPath(file: File): String = try {
-        file.canonicalPath
-    } catch (e: IOException) {
-        file.path
-    } catch (e: SecurityException) {
-        file.path
+    private fun realPath(vfs: Vfs, path: String): String = try {
+        resolveSymlinks(vfs, path)
+    } catch (e: FsException) {
+        path
     }
 
-    private fun matches(q: Query, file: File, display: String, depth: Int): Boolean {
+    private fun matches(vfs: Vfs, q: Query, path: String, stat: VStat, display: String, depth: Int): Boolean {
+        val name = fsName(display)
         if (depth < q.minDepth) return false
-        if (q.name != null && !Glob.matchSegment(q.name, file.name)) return false
-        if (q.iname != null && !Glob.matchSegment(q.iname.lowercase(Locale.US), file.name.lowercase(Locale.US))) {
+        if (q.name != null && !Glob.matchSegment(q.name, name)) return false
+        if (q.iname != null && !Glob.matchSegment(q.iname.lowercase(Locale.US), name.lowercase(Locale.US))) {
             return false
         }
         if (q.pathPattern != null && !Glob.matchWhole(q.pathPattern, display)) return false
-        if (q.type != null && !typeMatches(file, q.type)) return false
-        if (q.size != null && !q.size.matches(Cmds.sizeOf(file))) return false
-        if (q.empty && !isEmpty(file)) return false
+        if (q.type != null && !typeMatches(stat, q.type)) return false
+        if (q.size != null && !q.size.matches(Cmds.sizeOf(stat))) return false
+        if (q.empty && !isEmpty(vfs, path, stat)) return false
         return true
     }
 
-    private fun typeMatches(file: File, type: String): Boolean {
-        val link = fsIsLink(file)
+    private fun typeMatches(stat: VStat, type: String): Boolean {
+        val link = stat.type == VNodeType.SYMLINK
         return when (type) {
-            "f" -> file.isFile && !link
-            "d" -> file.isDirectory && !link
+            "f" -> stat.type == VNodeType.FILE && !link
+            "d" -> stat.type == VNodeType.DIRECTORY && !link
             "l" -> link
-            // A block device, a character device, a fifo and a socket are one thing to java.io.
-            else -> !link && !file.isFile && !file.isDirectory
+            // A block device, a character device, a fifo and a socket are one thing to a stat
+            // built from the JDK, which is the same answer `find` has always given for all four.
+            else -> !link && stat.type != VNodeType.FILE && stat.type != VNodeType.DIRECTORY
         }
     }
 
-    private fun isEmpty(file: File): Boolean {
-        if (!file.isDirectory) return Cmds.sizeOf(file) == 0L
-        val entries = try {
-            file.listFiles()
-        } catch (e: SecurityException) {
-            null
+    /** A directory this app may not list is not empty, and never was: `find -empty` skips it. */
+    private fun isEmpty(vfs: Vfs, path: String, stat: VStat): Boolean {
+        if (stat.type != VNodeType.DIRECTORY) return Cmds.sizeOf(stat) == 0L
+        return try {
+            vfs.readDir(path).isEmpty()
+        } catch (e: FsException) {
+            false
         }
-        return entries?.isEmpty() ?: false
     }
 
     private fun runExec(ctx: ExecContext, command: List<String>, path: String): Int {
         val name = command.first()
-        val target = CommandTable.lookup(name)
+        val target = ctx.session.table.lookup(name)
         if (target == null) {
             ctx.errLine("find: $name: command not found")
             return ExecContext.EXIT_NOT_FOUND

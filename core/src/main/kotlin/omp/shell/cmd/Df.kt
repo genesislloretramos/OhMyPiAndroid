@@ -3,43 +3,44 @@ package omp.shell.cmd
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
 import omp.shell.exec.FileCommand
-import java.io.File
+import omp.shell.fs.VDiskUsage
 import java.util.Locale
 
 @CommandSpec(
     name = "df",
     synopsis = "[-h] [path ...]",
     group = "system",
-    notes = "sizes come from File.getTotalSpace()/getUsableSpace() on each volume, not from a df binary",
+    notes = "sizes come from getTotalSpace()/getUsableSpace() on each volume, not from a df binary",
 )
 object Df : FileCommand() {
     override val flagSpec = "h"
 
     override fun execute(ctx: ExecContext, flags: String, options: Map<String, String>, operands: List<String>): Int {
         val human = flags.contains('h')
+        val vfs = ctx.session.vfs
         val rows = ArrayList<Row>()
         if (operands.isEmpty()) {
             for (v in ctx.services.storageVolumes()) {
                 if (v.usableBytes <= 0L && v.totalBytes <= 0L) continue
                 rows += Row(v.mountPoint, v.totalBytes, v.totalBytes - v.usableBytes, v.usableBytes)
             }
-            val data = File("/data")
-            if (data.exists()) {
-                rows += Row("/data", data.totalSpace, data.totalSpace - data.usableSpace, data.usableSpace)
+            // The two volumes Android does not report through StorageManager, asked of the
+            // filesystem itself: `/data` only when it is there, and `/` only when nothing else
+            // already claims the root.
+            if (fsStatOrNull(vfs, "/data") != null) {
+                rows += vfs.diskUsage("/data").toRow("/data")
             }
             if (rows.none { it.mount == "/" }) {
-                val root = File("/")
-                rows += Row("/", root.totalSpace, root.totalSpace - root.usableSpace, root.usableSpace)
+                rows += vfs.diskUsage("/").toRow("/")
             }
         } else {
             for (op in operands) {
                 val path = Cmds.resolve(ctx, op) ?: return ExecContext.EXIT_GENERAL_ERROR
-                val f = File(path)
-                if (!f.exists()) {
+                if (Cmds.statFollowedOrNull(vfs, path) == null) {
                     ctx.errLine("df: $op: No such file or directory")
                     return ExecContext.EXIT_GENERAL_ERROR
                 }
-                rows += Row(path, f.totalSpace, f.totalSpace - f.usableSpace, f.usableSpace)
+                rows += vfs.diskUsage(path).toRow(path)
             }
         }
         if (rows.isEmpty()) {
@@ -58,4 +59,6 @@ object Df : FileCommand() {
     }
 
     private class Row(val mount: String, val total: Long, val used: Long, val avail: Long)
+
+    private fun VDiskUsage.toRow(mount: String): Row = Row(mount, totalBytes, totalBytes - freeBytes, freeBytes)
 }
