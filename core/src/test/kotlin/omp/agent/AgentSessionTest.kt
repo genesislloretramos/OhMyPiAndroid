@@ -582,9 +582,12 @@ class AgentSessionTest {
      *
      * "This device" is what decides whether the plaintext warning is printed, and it is the one
      * check standing between a user and a key going out in the clear. Every shape is here that a
-     * real configuration produces, and the two that matter most are the ones a prefix match gets
+     * real configuration produces, and the ones that matter most are the ones a prefix match gets
      * wrong: `127.0.0.1.nip.io` and `127.0.0.1.evil.test` are names anybody can register and point
-     * anywhere, so they are **not** this device and they are warned about.
+     * anywhere, so they are **not** this device and they are warned about. The short forms are here
+     * for the other direction — `http://127.1:11434` is a real thing a user types for a model on
+     * this machine, and warning about it is the noise that teaches a user to ignore the warning
+     * that matters.
      */
     @Test
     fun whatTheEndpointCheckKnowsAboutThisDeviceAndAboutSchemes() {
@@ -595,6 +598,10 @@ class AgentSessionTest {
             "http://localhost:8080/v1",
             "http://localhost.:8080/v1",
             "http://0.0.0.0:11434/v1",
+            // The short forms a socket reads as this device, with the missing bytes zero-filled.
+            "http://127:11434/v1",
+            "http://127.1:11434/v1",
+            "http://127.0.1:11434/v1",
         )
         val elsewhere = listOf(
             "http://192.168.1.10:8080/v1",
@@ -603,8 +610,13 @@ class AgentSessionTest {
             // The two a prefix match would wave through: names, not addresses.
             "http://127.0.0.1.nip.io/v1",
             "http://127.0.0.1.evil.test/v1",
-            "http://127.0.999.0.1/v1",
+            "http://127.999.0.1/v1",
             "http://127x0.0.1/v1",
+            // And the shapes that look like the short forms without being an address: five labels,
+            // a label that is not a byte, and a block that is not 127/8.
+            "http://127.1.2.3.4/v1",
+            "http://127.0.300/v1",
+            "http://128.1/v1",
         )
         for (url in here) {
             val ready = Endpoint.of(url) as Endpoint.Ready

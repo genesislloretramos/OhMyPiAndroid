@@ -29,7 +29,9 @@ import omp.vm.workspace.Workspace
  *
  * **This app's own `.omp` folder is not searched.** The transcript in it is a conversation with
  * the model written in the model's own words, and a search that found it would answer every
- * question about what was said before with a copy of what was said before.
+ * question about what was said before with a copy of what was said before. The walk skips it
+ * here because the walk does not ask [omp.agent.tools.Sandbox] about each name it finds, and
+ * `read_file` on the same folder is refused by the boundary either way.
  */
 object Search : FileTool() {
 

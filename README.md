@@ -230,12 +230,27 @@ model that is confidently wrong about where it may write, a `..` that walked out
 and it is not a wall against a determined caller, which in this app would be Kotlin inside the app
 the user already installed.
 
+**The conversation's own `.omp` folder is inside the folder and is still not the model's.** The
+transcript and the state file are refused — **for a write and for a read** — because a model that
+can write `state.json` has the *next* request sent to a `base_url` of its own choosing, and a
+model that can read the transcript is reading this conversation back in its own words. `list_dir`
+still lists it as an entry, because it is a real folder the user can see in a file manager; asking
+to go *into* it is what is answered, by the same class and in the same words.
+
 **Every write is put to the user, one keypress at a time.** Before any `write_file` or `edit_file`
 the agent prints the path, the same path as a file manager shows it, the size, and for an edit the
 old and the new text. `y` goes ahead; anything else cancels that call and the model is told the user
 declined. A Ctrl-C cancels the call and gives the terminal back. **`omp --yes` approves every call
 in that turn without asking, and the transcript records `auto` rather than `y`** — so a folder read
 afterwards can tell a write nobody looked at from one a person did.
+
+An `edit_file` whose old or new text carries a control character — a carriage return, a bell, an
+escape sequence — is refused **before the question is asked**, because that question is the one
+place a human answers with a single keystroke and it would be drawn in the model's own words. The
+way out is `write_file`, whose prompt is made of the path and the size and shows no text at all.
+For the same reason, a tool result on the screen spells those characters out rather than sending
+them: a file the user wrote can hold a carriage return, and it must not be able to rewrite the
+line above it.
 
 **There is no `run` tool, and that is a decision.** A shell inside this VM is a shell that can
 `vm reset` and destroy the namespace the conversation is in, and the model picks its own command

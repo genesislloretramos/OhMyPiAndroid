@@ -23,7 +23,8 @@ object ReadFile : FileTool() {
     override val description =
         "Read one UTF-8 text file in this conversation's folder. 'path' is relative to that " +
             "folder or absolute inside it; a path outside it is refused, and so is the folder " +
-            "above it that holds the other conversations. 'offset' is the 1-based line to start " +
+            "above it that holds the other conversations, and so is the folder this app keeps " +
+            "its own transcript and configuration in. 'offset' is the 1-based line to start " +
             "at and 'limit' is how many lines to return; with neither, the whole file is " +
             "returned, and a file too large to return in one piece is refused with its size " +
             "rather than truncated — read it again with an offset and a limit. A directory is " +

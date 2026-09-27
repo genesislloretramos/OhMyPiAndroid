@@ -12,10 +12,15 @@ import omp.shell.fs.VNodeType
  * about next. The description says so, because a model told "lists a directory" reasonably
  * expects `tree`.
  *
- * **What is here is what the user sees, including this app's own bookkeeping.** The `.omp` folder
- * holding the transcript and the state file is listed like anything else rather than hidden: it
- * is a real folder in the user's `Documents`, and a tool that pretended otherwise would be making
- * a claim about the filesystem that the filesystem does not support.
+ * **This app's own bookkeeping is listed and not entered.** The `.omp` folder holding the
+ * transcript and the state file is listed like anything else rather than hidden: it is a real
+ * folder in the user's `Documents`, and a tool that pretended otherwise would be making a claim
+ * about the filesystem that the filesystem does not support. **Asking to go into it is refused**,
+ * by [omp.agent.tools.Sandbox] and not here — the same verdict a read of the container gets, for
+ * the same reason: the transcript is this conversation in the model's own words, and reading it
+ * back answers every question about what was said before with a copy of what was said before.
+ * So the name is visible and the contents are not, which is what a person gets too: the folder is
+ * there in the file manager, and the transcript in it is theirs rather than a tool result.
  */
 object ListDir : FileTool() {
 
@@ -27,7 +32,9 @@ object ListDir : FileTool() {
             "'path' the conversation's own folder is listed. This is one folder, not a tree: a " +
             "subfolder is listed by name and you list it with a second call. A path outside this " +
             "conversation's folder is refused, and so is the folder above it that holds the other " +
-            "conversations. A file is refused; read_file reads one."
+            "conversations, and so is the folder this app keeps its own transcript and " +
+            "configuration in — its name is in the listing, and going into it is not. A file is " +
+            "refused; read_file reads one."
 
     override val parameters = Tools.schema(
         linkedMapOf(

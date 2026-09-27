@@ -458,18 +458,38 @@ class Session(
      * this app writes — a tool-round cap, a cancellation at an approval — are [Kind.SYSTEM] and
      * are not sent, because they are a fact about this app's loop rather than something a model
      * was told.
+     *
+     * **An exchange that cannot be paired is left out whole** — the calls *and* the results, and
+     * the assistant line is sent as the plain text it is. A `tool` message with no call above it
+     * is refused by every endpoint, and so is an assistant line whose calls nothing answers, and
+     * the app can produce the second of those itself: a Ctrl-C at an approval stops the round
+     * after the model's request was already written down, and the next question would otherwise
+     * go out with a request nothing had run. Repairing the pairing is what makes [callsOf]'s
+     * "recoverable" claim true; rewriting the sentence would not.
      */
     private fun request(model: String, asked: String?): Json.Obj {
         val messages = ArrayList<Json>()
         messages += message("system", systemPrompt())
+        val exchange = Exchange()
         for (entry in conversation.read()) {
             when (entry.kind) {
-                Kind.USER -> messages += message("user", entry.content)
-                Kind.ASSISTANT -> messages += message("assistant", entry.content, callsOf(entry))
-                Kind.TOOL_RESULT -> messages += toolMessage(entry, fallback = MINTED)
+                Kind.USER -> {
+                    exchange.flush(messages)
+                    messages += message("user", entry.content)
+                }
+
+                Kind.ASSISTANT -> {
+                    exchange.flush(messages)
+                    exchange.open(entry, callsOf(entry))
+                }
+
+                // A result is never sent on its own: it belongs to the exchange it follows, and
+                // an exchange that is not open has no results to belong to.
+                Kind.TOOL_RESULT -> exchange.add(entry)
                 Kind.SYSTEM -> continue
             }
         }
+        exchange.flush(messages)
         if (asked != null) messages += message("user", asked)
         return Json.Obj(
             linkedMapOf(
@@ -479,6 +499,59 @@ class Session(
                 STREAM to Json.Bool(true),
             ),
         )
+    }
+
+    /**
+     * One tool exchange — an assistant line that asked for tools, and the results that follow it —
+     * held together until whatever comes next decides whether it can be paired at all.
+     *
+     * **Replayed whole or not at all**, which is the only rule here and the one that makes the two
+     * half-pairs impossible. A result whose call is not there, and a call whose result is not
+     * there, are the same defect seen from either end; repairing one of them on its own leaves the
+     * other. The counts decide it rather than the ids, because an id lost to a text editor is a
+     * fact about one line and a reason to keep the rest of the exchange, not to throw it away.
+     */
+    private inner class Exchange {
+        private var asked: Entry? = null
+        private var calls: Json.Arr? = null
+        private val results = ArrayList<Entry>()
+
+        /** [calls] is what [callsOf] recovered, and null when it recovered nothing. */
+        fun open(entry: Entry, calls: Json.Arr?) {
+            asked = entry
+            // An empty array is not a tool request: it is a field that is there and says nothing,
+            // and a result under it would be a `tool` message with no call above it.
+            this.calls = calls?.takeIf { it.items.isNotEmpty() }
+            results.clear()
+        }
+
+        fun add(entry: Entry) {
+            if (asked != null) results.add(entry)
+        }
+
+        fun flush(messages: MutableList<Json>) {
+            val entry = asked ?: return
+            val wanted = calls?.takeIf { results.size >= it.items.size }
+            asked = null
+            calls = null
+            // Without the calls the assistant line is still a true thing that was said, and the
+            // results are the part no call can answer.
+            messages += message("assistant", entry.content, wanted)
+            if (wanted == null) {
+                results.clear()
+                return
+            }
+            for (result in results) messages += toolMessage(result, minted(messages.size))
+            results.clear()
+        }
+
+        /**
+         * The id for a result whose own was lost, and @return a different one for every result in
+         * a request. The position the result takes in [messages] is that number: it is unique by
+         * construction, so two orphans in one request are two pairs rather than one pair twice,
+         * and it cannot be confused with an id the endpoint chose.
+         */
+        private fun minted(at: Int) = "call_omp_$at"
     }
 
     /**
@@ -500,8 +573,11 @@ class Session(
      *
      * [fallback] is for a transcript whose result line has lost its id, which a text editor can do
      * and [omp.agent.store.Conversation] deliberately does not treat as a reason to lose the rest
-     * of the conversation. The pair is then only self-consistent, and a request that pairs them
-     * wrongly is better than one that pairs them not at all.
+     * of the conversation. **One is minted per result** rather than one for all of them: a single
+     * constant would give two orphans the same `tool_call_id`, which pairs with nothing twice
+     * instead of once, and a reader of the transcript could not tell a recovered line from a
+     * genuine one. The pair is still only self-consistent, and a request that pairs it wrongly is
+     * better than one that leaves the result out of a conversation that is otherwise whole.
      */
     private fun toolMessage(entry: Entry, fallback: String): Json.Obj = Json.Obj(
         linkedMapOf(
@@ -516,7 +592,10 @@ class Session(
      *
      * A transcript is a file in the user's `Documents`: a sync tool or a text editor can leave a
      * field that does not parse, and an assistant message replayed without its calls is a
-     * recoverable history where a request built from a broken array is not.
+     * recoverable history where a request built from a broken array is not. **Recoverable means
+     * repaired**: [Exchange] leaves the exchange that line was part of out of the request rather
+     * than sending the results it lost the calls for, so what arrives is a history the endpoint
+     * accepts instead of one it refuses for a reason that is not the model's fault.
      */
     private fun callsOf(entry: Entry): Json.Arr? {
         val raw = entry.extra[TOOL_CALLS] ?: return null
@@ -658,16 +737,42 @@ class Session(
      * phone. The count of what is not shown is on the same line as the cut, for the same reason
      * the edit preview counts what it leaves out: a truncated thing that does not say it was
      * truncated is a lie told to the one person who can check it.
+     *
+     * **And every line goes out through [onScreen] first.** A result is text this app did not
+     * write — it is usually a file the user wrote — and a carriage return in one moves the cursor
+     * and rewrites the lines above, including the `returned:` line naming the tool. The rule is
+     * the one [omp.agent.tools.Sandbox] already applies to a path, for the same reason: a newline
+     * is one line of a transcript and one line of a diagnostic, and the other characters are the
+     * ones a screen acts on. `ls -b` is the same answer for a directory listing.
      */
     private fun reported(call: Call, text: String) {
         out.line("$TAG: ${call.name} returned:")
         val lines = text.split('\n')
         val shown = lines.size.coerceAtMost(SHOWN_LINES)
-        for (i in 0 until shown) out.line("  ${lines[i]}")
+        for (i in 0 until shown) out.line("  ${onScreen(lines[i])}")
         val more = lines.size - shown
         if (more > 0) {
             out.line("  … $more more line(s); all of it is in ${conversation.path}")
         }
+    }
+
+    /**
+     * [line] with every character a terminal acts on spelled out instead of sent, as the C escapes
+     * a person reads: `\r` is a carriage return and U+009B is a CSI, and neither is a thing to
+     * put on a screen that somebody is reading a tool result on.
+     */
+    private fun onScreen(line: String): String {
+        val text = StringBuilder(line.length)
+        for (c in line) {
+            val code = c.code
+            when {
+                code < 0x20 -> text.append(ESCAPES[code] ?: "\\x%02x".format(code))
+                code == 0x7F -> text.append("\\x7f")
+                code in 0x80..0x9F -> text.append("\\u%04x".format(code))
+                else -> text.append(c)
+            }
+        }
+        return text.toString()
     }
 
     /**
@@ -1117,8 +1222,15 @@ class Session(
         /** How much of a call's own arguments is quoted back when they will not parse. */
         private const val ARGS_SHOWN = 120
 
-        /** The id a result whose own has been lost in the transcript is paired with. */
-        private const val MINTED = "call_omp_0"
+        /**
+         * The C0 characters a printed line spells out, in the spelling a reader of a C string
+         * already knows. A newline is absent because the line has none left in it by the time it
+         * gets here; the rest is what a file the user wrote can carry into a tool result.
+         */
+        private val ESCAPES = mapOf(
+            0x00 to "\\0", 0x07 to "\\a", 0x08 to "\\b", 0x09 to "\\t", 0x0B to "\\v",
+            0x0C to "\\f", 0x0D to "\\r", 0x1B to "\\e",
+        )
 
         /** The printable ASCII range, the only bytes echoed at the one-character prompt. */
         private val PRINTABLE = 0x20..0x7E

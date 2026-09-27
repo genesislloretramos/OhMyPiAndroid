@@ -14,6 +14,14 @@ import omp.shell.fs.VNodeType
  * can always supply. The description says both, because a model that does not know will happily
  * send a one-word `old` and get a refusal it could have avoided.
  *
+ * **Neither text may carry a character a terminal acts on.** The approval prompt is the one
+ * question in this app a human answers with a single keystroke, and it is drawn partly in the
+ * model's own words: a carriage return, a BEL or an escape sequence in `old` or `new` puts the
+ * cursor anywhere and the `approve?` line wherever the model liked it. [check] refuses those
+ * before the question is asked, naming the character — which is why a file that genuinely needs
+ * one is a file to `write_file`, whose prompt is made of the path and the size and shows no text
+ * at all.
+ *
  * **The file is read again after the approval.** [check] reads it to validate, [preview] reads it
  * to show the two texts, and [act] reads it once more to change it — so the edit lands on the
  * bytes that were there when the user typed `y`, not on the ones that were there when the
@@ -29,8 +37,11 @@ object EditFile : FileTool() {
             "is refused rather than guessed at, and you should send 'old' with more of the " +
             "surrounding lines in it. 'new' is what replaces it, and may be empty to delete it. " +
             "Nothing else in the file changes. A path outside this conversation's folder is " +
-            "refused. The user is shown the path and both texts and is asked to approve; if they " +
-            "decline nothing is changed and you are told."
+            "refused, and so is the folder this app keeps its own transcript and configuration " +
+            "in. 'old' and 'new' may not contain a control character such as a tab or a carriage " +
+            "return: this prompt shows them to the user, and a file that needs one is a file to " +
+            "rewrite with write_file. The user is shown the path and both texts and is asked to " +
+            "approve; if they decline nothing is changed and you are told."
 
     override val parameters = Tools.schema(
         linkedMapOf(
@@ -58,6 +69,21 @@ object EditFile : FileTool() {
         }
         if (arguments.str("new") == null) {
             return Refusal("refused: 'new' is required and has to be a string. Nothing was changed.")
+        }
+        // Before the file is even read: the question this call would ask is drawn in this text, and
+        // the whole point of refusing here is that the question is never asked at all.
+        for (key in listOf("old", "new")) {
+            val control = shownAs(arguments.str(key).orEmpty())
+            if (control != null) {
+                return Refusal(
+                    "refused: '$key' contains a character a terminal acts on rather than prints " +
+                        "— $control — and this call puts that text in front of the user on the line " +
+                        "they answer with one keypress, so it is not accepted here either. Nothing " +
+                        "was changed. A file that really needs one is a file to write with " +
+                        "write_file instead: that prompt names the path and the size and shows " +
+                        "none of the text.",
+                )
+            }
         }
         val stat = env.vfs.stat(path.value)
         if (stat.type == VNodeType.DIRECTORY) {
@@ -144,6 +170,30 @@ object EditFile : FileTool() {
     }
 
     /**
+     * How the first character in [text] a terminal acts on is named, and @return null when there
+     * is none.
+     *
+     * **A newline is the one that is allowed, because an edit is a piece of text and a piece of
+     * text has lines in it.** Everything else in C0 moves the cursor, rings, or erases, and the
+     * C1 range is here because U+009B is a CSI and a CSI is what an escape sequence is made of —
+     * a model that had read a file full of them would otherwise have a working cursor-mover.
+     *
+     * The name is the one a person would use for it, with the byte beside it, because "your text
+     * is not allowed" is a sentence a model cannot act on and "a CR (0x0D)" is one it can.
+     */
+    private fun shownAs(text: String): String? {
+        for (c in text) {
+            val code = c.code
+            if (c == '\n') continue
+            if (code < 0x20 || code == 0x7F || code in 0x80..0x9F) {
+                val name = NAMES[code]
+                return if (name == null) "U+%04X".format(code) else "$name (0x%02X)".format(code)
+            }
+        }
+        return null
+    }
+
+    /**
      * A piece of text as the user is shown it, cut **with the size of what was cut**.
      *
      * A preview that silently showed the first eight lines of a three-hundred-line replacement is
@@ -170,6 +220,12 @@ object EditFile : FileTool() {
 
     /** How many characters survive onto the screen before the count takes over. */
     private const val CHARS = 400
+
+    /** The names of the C0 characters a source file is most likely to carry, for the refusal. */
+    private val NAMES = mapOf(
+        0x00 to "NUL", 0x07 to "BEL", 0x08 to "BS", 0x09 to "TAB", 0x0B to "VT",
+        0x0C to "FF", 0x0D to "CR", 0x1B to "ESC", 0x7F to "DEL",
+    )
 
     private const val STRING = "string"
 }

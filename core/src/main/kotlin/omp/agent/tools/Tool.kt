@@ -242,14 +242,24 @@ object Tools {
         ),
     )
 
-    /** How the boundary refused, in a sentence a model can act on rather than only re-read. */
-    fun refusal(asked: String, e: FsException): String {
+    /**
+     * How the boundary refused, in a sentence a model can act on rather than only re-read.
+     *
+     * [sandbox] is asked which of the refusals this is, because [omp.agent.tools.Sandbox] is what
+     * decided: a second copy of that comparison in here would be a boundary check that can be
+     * forgotten, and a model told the wrong reason for a refusal it cannot get past.
+     */
+    fun refusal(sandbox: Sandbox, asked: String, e: FsException): String {
         val where = e.path?.takeIf { it.isNotBlank() } ?: asked
         val errno = e.errno
         val because = when (errno) {
-            FsErrno.PERM_DENIED ->
-                "it is not inside this conversation's folder, and this build writes nothing outside " +
-                    "it — not even a read of the conversations folder above this one"
+            FsErrno.PERM_DENIED -> if (sandbox.ownMetadata(asked)) {
+                Sandbox.OWN_METADATA
+            } else {
+                "it is not inside this conversation's folder, and this build writes nothing " +
+                    "outside it — not even a read of the conversations folder above this one"
+            }
+
             FsErrno.SYMLINK_LOOP -> "a symbolic link in the way is a loop"
             else -> errno.text
         }
@@ -297,7 +307,7 @@ abstract class FileTool : Tool {
     } catch (e: FsException) {
         // The seam's own errno, in a sentence the model can read. Nothing a filesystem refuses
         // ends a session; it ends a tool call.
-        Outcome.Result(Tools.refusal(arguments.str(PATH) ?: e.path.orEmpty(), e))
+        Outcome.Result(Tools.refusal(env.sandbox, arguments.str(PATH) ?: e.path.orEmpty(), e))
     }
 
     private fun runChecked(env: ToolEnv, arguments: Json.Obj): Outcome {

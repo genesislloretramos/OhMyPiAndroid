@@ -283,6 +283,45 @@ class SandboxTest {
     }
 
     @Test
+    fun thisConversationsOwnMetadataFolderIsRefusedInEverySpellingAndUnderAnyOtherName() {
+        // The one folder inside the project the agent was not given: the transcript it is replayed
+        // from and the state file the next turn is run from. Every spelling a model can write is
+        // here, and so is the shape that gets past a name check — a link to it under another name.
+        vfs.mkdir("/mnt/omp/photos/.omp")
+        vfs.writeBytes("/mnt/omp/photos/.omp/state.json", STATE.toByteArray())
+        vfs.mkdir("/mnt/omp/photos/.ompx")
+        for (raw in listOf(
+            ".omp",
+            ".omp/state.json",
+            ".omp/transcript.jsonl",
+            ".omp/x/y.json",
+            "/mnt/omp/photos/.omp/state.json",
+        )) {
+            assertEquals(raw, FsErrno.PERM_DENIED, errnoOf { box.resolve(raw) })
+            assertFalse(raw, box.contains(raw))
+            assertNull(raw, box.projectRelative(raw))
+        }
+        // The refusal names the folder as the model would recognise it, not as the kernel would.
+        assertEquals(FsErrno.PERM_DENIED to ".omp/state.json", refused(".omp/x/../state.json"))
+        // And the file it would have written is still exactly what it was.
+        assertEquals(STATE, vfs.readBytes("/mnt/omp/photos/.omp/state.json").toString(Charsets.UTF_8))
+        // A folder whose name merely starts the same is the user's, not this app's.
+        assertEquals("/mnt/omp/photos/.ompx/notes.md", box.resolve(".ompx/notes.md").value)
+        // The name is answered as the model wrote it, which is what the refusal sentence is built
+        // from, and a name in another conversation is not this conversation's business.
+        assertTrue(box.ownMetadata(".omp"))
+        assertTrue(box.ownMetadata(".omp/state.json"))
+        assertTrue(box.ownMetadata("/mnt/omp/photos/.omp/x"))
+        assertFalse(box.ownMetadata("notes.md"))
+        assertFalse(box.ownMetadata("/mnt/omp/videos/.omp"))
+        // A link written under another name leads here and is refused here, which is why the check
+        // is made on the name the kernel will act on and not on the one that was typed.
+        vfs.symlink("/mnt/omp/photos/.omp", "/mnt/omp/photos/cuentas")
+        assertEquals("/mnt/omp/photos/.omp/state.json", vfs.realpath("/mnt/omp/photos/cuentas/state.json"))
+        assertEquals(FsErrno.PERM_DENIED, errnoOf { box.resolve("cuentas/state.json") })
+    }
+
+    @Test
     fun aLinkToASiblingConversationIsFollowedAndTheTargetIsWhatIsChecked() {
         vfs.symlink("/mnt/omp/videos", "/mnt/omp/photos/out")
         // The link is a real one and it really points there, so the refusal below is the class
@@ -444,5 +483,10 @@ class SandboxTest {
         throw AssertionError("expected a refusal for '$raw'")
     } catch (e: FsException) {
         e.errno to e.path
+    }
+
+    private companion object {
+        /** A state file as the app writes it: the `base_url` is what makes writing one dangerous. */
+        const val STATE = """{"provider":"openai","base_url":"https://elsewhere.test/v1","model":"x"}"""
     }
 }

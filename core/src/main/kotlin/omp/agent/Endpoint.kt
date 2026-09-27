@@ -32,9 +32,10 @@ import java.net.URL
  * **"This device" means a literal address, not a name that starts like one.** `127.0.0.1.evil.test`
  * and `127.0.0.1.nip.io` are names anybody can register, and under a DNS server they run they
  * resolve wherever they like; treating either as loopback would suppress the plaintext warning
- * and send the key in the clear to whatever the name points at. So [isLoopback] parses the whole
- * host as four decimal octets, and anything with a letter or a fifth label in it is not this
- * device.
+ * and send the key in the clear to whatever the name points at. So [inLoopbackBlock] reads the
+ * whole host as a literal IPv4 in 127/8 — in any of the short forms a socket accepts, because
+ * `http://127.1:11434` is a real thing a user types — and anything with a letter or a fifth label
+ * in it is not this device.
  */
 sealed class Endpoint {
 
@@ -150,8 +151,8 @@ sealed class Endpoint {
          * No [java.net.InetAddress] and no resolver lookup: a reverse lookup of a host that does
          * not resolve is a DNS query a user did not ask for, on the one code path that is about to
          * handle their credential. What that buys is that the answer has to come out of the string
-         * itself, so a **whole** literal IPv4 in 127/8 is required and a name that merely starts
-         * `127.` is not one: `127.0.0.1.nip.io` is a name somebody else can point anywhere.
+         * itself, so **a literal IPv4 in 127/8 is required and a name that merely starts `127.` is
+         * not one**: `127.0.0.1.nip.io` is a name somebody else can point anywhere.
          *
          * [ANY] is the other form of "this device" a server binds and a user then types, and
          * [THIS_HOST] is the trailing-dot spelling of `localhost`, which the same resolver answers
@@ -164,15 +165,21 @@ sealed class Endpoint {
         }
 
         /**
-         * Four decimal octets, 0..255, in 127/8 — and nothing else.
+         * A literal IPv4 in 127/8 in any of the forms a socket library accepts, and nothing else.
          *
-         * A host that is not exactly this is a host whose name somebody chose, which is the case
-         * the warning exists for.
+         * **One to four labels, every one of them a decimal byte, and the first exactly `127`.**
+         * The short forms are the same address written the way `inet_aton` reads it, with the
+         * missing bytes zero-filled: `127.1` is `127.0.0.1` and `http://127.1:11434` is a real
+         * thing a user runs a local model on, so a check that insisted on four labels warned about
+         * a request that never leaves the machine — the noise that teaches a user to ignore the
+         * warning that matters. A fifth label is refused rather than truncated for the reason the
+         * KDoc above gives, and so is anything with a letter in it: `127.0.0.1.nip.io` and
+         * `127.0.0.1.evil.test` are names anybody can register.
          */
         private fun inLoopbackBlock(name: String): Boolean {
-            if (!name.startsWith("127.")) return false
             val parts = name.split('.')
-            if (parts.size != 4) return false
+            if (parts.size > 4) return false
+            if (parts.isEmpty() || parts[0] != LOOPBACK) return false
             for (part in parts) {
                 if (part.isEmpty() || part.length > 3) return false
                 for (c in part) if (c < '0' || c > '9') return false
@@ -183,6 +190,9 @@ sealed class Endpoint {
 
         /** The name a loopback server is reached by, spelled once because it is checked twice. */
         private const val LOCALHOST = "localhost"
+
+        /** The first label of an address in the block that means this device. */
+        private const val LOOPBACK = "127"
 
         /** The address that means "this machine" to a server that binds it and a client that uses it. */
         private const val ANY = "0.0.0.0"

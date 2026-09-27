@@ -1,5 +1,6 @@
 package omp.agent.tools
 
+import omp.agent.store.META_DIR
 import omp.shell.fs.FsErrno
 import omp.shell.fs.FsException
 import omp.shell.fs.PathResolver
@@ -7,7 +8,8 @@ import omp.shell.fs.VNodeType
 import omp.shell.fs.Vfs
 
 /**
- * The boundary an AI agent is given: one conversation folder, and nothing it can name outside it.
+ * The boundary an AI agent is given: one conversation folder, and nothing it can name inside it
+ * that this conversation keeps for itself.
  *
  * The user permitted exactly one directory — *Internal storage ▸ Documents ▸ omp*, which is
  * `/mnt/omp` in the namespace and the same bytes under another name on the phone — and the agent
@@ -24,6 +26,20 @@ import omp.shell.fs.Vfs
  * it. One folder was given, so one folder is the answer. A *read* of the container is refused for
  * the same reason: a verdict here is one per path, and a path this class refuses is one a tool can
  * neither read nor write. Listing the other conversations is a capability the agent was not given.
+ *
+ * **The conversation's own [META_DIR] folder is refused, and reads with it.** The transcript in
+ * there is this conversation in the model's own words, and the state file beside it is what the
+ * *next* turn is run from — so a model that can write `.omp` can aim the API key at an endpoint of
+ * its own choosing on the following request, and can rewrite the history it is replayed from. A
+ * user approving "edit `.omp/state.json`" was told a config file was changing; nothing on the
+ * screen says what a config file *does* here. **The verdict is the same for a read**, which is
+ * the point of the rule being one: the transcript is a copy of what the model was already told,
+ * and [omp.agent.tools.Search] already refuses to walk into this folder for the same reason, so
+ * allowing `read_file` here would undo a decision made elsewhere. Listing it is not refused,
+ * because [omp.agent.tools.ListDir] listing the conversation's real contents — `.omp` and all —
+ * is a claim about the filesystem rather than a grant: the folder shows up as an entry of the
+ * conversation, and asking to go *into* it is what is answered. The whole of the rule is
+ * [ownMetadata] and the answer is [OWN_METADATA], so the sixth tool inherits it.
  *
  * **A name is compared exactly, and the volume behind it is not.** `Documents/omp` is exFAT: there,
  * `Photos` and `photos` are one directory, and `café` typed as `e` + U+0301 is another spelling of
@@ -74,6 +90,21 @@ class Sandbox(private val vfs: Vfs, val container: String, val project: String) 
          * did not name.
          */
         const val MAX_PATH = 1024
+
+        /**
+         * Why this conversation's own folder is refused, in the words a model reads it in.
+         *
+         * It lives here rather than in [omp.agent.tools.Tools] because the boundary is what
+         * decided, and a refusal that explains a decision somewhere other than the place that made
+         * it is one refactoring away from being wrong. The wording answers the two questions a
+         * model actually has — *is it mine to touch* and *what do I do instead* — and the second
+         * one is a person, because the folder is in the user's `Documents` and they can open it.
+         */
+        const val OWN_METADATA =
+            "it is this conversation's own $META_DIR folder — the transcript of what has been " +
+                "said here and the configuration this turn is being run from — and neither it nor " +
+                "anything in it is yours to read or write; if you believe something in it is " +
+                "wrong, say so and let the user change it"
     }
 
     /**
@@ -126,6 +157,12 @@ class Sandbox(private val vfs: Vfs, val container: String, val project: String) 
      * A project folder that is itself a link out of the container makes every path in it a
      * refusal, which is the honest answer: the conversation was not in the folder the user opened.
      *
+     * [OWN_METADATA] is refused here and not in the tools: the first component below the project
+     * is this conversation's own bookkeeping, whatever the model spelled it as, and the check is
+     * made against the name the kernel will act on rather than the one that was typed — so a link
+     * called `notes` that lands in the metadata folder is refused with the rest of them, which is
+     * the only way a rule like this survives a tool that creates links.
+     *
      * The answer is [FsErrno.PERM_DENIED] — not a bespoke exception, because every diagnostic in
      * this codebase is built from one errno, and a tool that had to learn a second failure type
      * would eventually forget it. A name this class will not put in the filesystem at all (a NUL, a
@@ -166,7 +203,28 @@ class Sandbox(private val vfs: Vfs, val container: String, val project: String) 
         val real = throughLinks(absolute)
         if (real.length > MAX_PATH) throw FsException(FsErrno.PERM_DENIED, raw)
         val relative = below(real) ?: throw FsException(FsErrno.PERM_DENIED, real)
+        // On the name the kernel will act on, so a link written under another name is answered the
+        // same way as the folder itself — see the KDoc above for why this is the one place.
+        if (ownMetadata(relative)) throw FsException(FsErrno.PERM_DENIED, relative)
         return Path(real, relative, relative == ".")
+    }
+
+    /**
+     * Whether [raw] — as a model wrote it, relative to the project or absolute in the namespace —
+     * names this conversation's own [META_DIR] folder or something inside it.
+     *
+     * **The whole rule, and the one question asked of it.** [resolve] refuses the answer and
+     * [omp.agent.tools.Tools] prints [OWN_METADATA] for it, so the sentence a model reads and the
+     * decision that produced it cannot drift apart; a second copy of the comparison in a tool is
+     * a boundary check that forgot where it was.
+     *
+     * A name outside the project is not this folder's business: the refusal for that is the
+     * boundary's, and it is a truer sentence than this one would be.
+     */
+    fun ownMetadata(raw: String): Boolean {
+        val asked = if (raw.startsWith("/")) raw else "$projectPath/$raw"
+        val relative = below(PathResolver.normalize(asked)) ?: return false
+        return relative == META_DIR || relative.startsWith("$META_DIR/")
     }
 
     /**

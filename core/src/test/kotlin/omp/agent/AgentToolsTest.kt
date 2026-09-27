@@ -120,7 +120,28 @@ class AgentToolsTest {
         (server.executor as ExecutorService).shutdownNow()
     }
 
+    /**
+     * The endpoint every OpenAI-compatible service is, including the two rules about a tool
+     * exchange: a `tool` message must answer a call, and a call must be answered.
+     *
+     * **It is a 400 rather than a shrug, because that is what a real endpoint does**, and because
+     * a stub that answers everything proves nothing about a request's shape: a session whose
+     * history cannot be sent would look exactly like one that worked. It checks the *shape* — the
+     * count of calls against the count of results — and not whether the ids match, because a
+     * transcript a text editor has been through can carry a result whose id was lost and the app
+     * sends one anyway, by design and by its own KDoc.
+     */
     private fun serve(exchange: HttpExchange) {
+        val body = exchange.requestBody.readBytes().toString(StandardCharsets.UTF_8)
+        val unpaired = unpairable(body)
+        if (unpaired != null) {
+            val answer = """{"error":{"message":"$unpaired"}}"""
+            val bytes = answer.toByteArray(StandardCharsets.UTF_8)
+            exchange.sendResponseHeaders(400, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.responseBody.close()
+            return
+        }
         val script = synchronized(scripts) { scripts.removeAt(0) }
         exchange.responseHeaders.add("Content-Type", "text/event-stream")
         // 0 is chunked, which is what a 200 SSE response is.
@@ -132,6 +153,25 @@ class AgentToolsTest {
             if (chunk.pauseMillis > 0) Thread.sleep(chunk.pauseMillis)
         }
         out.close()
+    }
+
+    /** @return what a real endpoint would refuse this body for, or null when it is a shape it takes. */
+    private fun unpairable(body: String): String? {
+        val messages = ((Json.parse(body) as? Json.Obj)?.arr("messages")) ?: return null
+        var unanswered = 0
+        for (message in messages) {
+            val one = message as? Json.Obj ?: return "a message is not an object"
+            when (one.str("role")) {
+                "assistant" -> unanswered = one.arr("tool_calls")?.size ?: 0
+                "tool" -> {
+                    if (unanswered == 0) return "a tool message answers no call"
+                    unanswered--
+                }
+
+                else -> if (unanswered > 0) return "an assistant asked for tools nothing answered"
+            }
+        }
+        return if (unanswered > 0) "an assistant asked for tools nothing answered" else null
     }
 
     // ---- a write the user said yes to ---------------------------------------------------------
@@ -314,6 +354,132 @@ class AgentToolsTest {
         assertTrue(results[1].content.contains("not even a read of the conversations folder"))
     }
 
+    /**
+     * The conversation's own bookkeeping is refused, in every spelling, for both tools that change
+     * the disk — and the two files in it are byte-for-byte what they were.
+     *
+     * A model that could write `.omp/state.json` has the **next** request sent to a `base_url` of
+     * its own choosing, through the same endpoint check, with a user who approved what the prompt
+     * called "editing a config file in your project". The prompt cannot carry that warning: it
+     * names a path, and a path called `.omp/state.json` looks like bookkeeping a person does. So
+     * the boundary is the only place that can answer it, and it answers once for both tools.
+     */
+    @Test
+    fun theConversationsOwnMetadataFolderIsNotTheModelsToWrite() {
+        val project = open("notas")
+        configure(project)
+        storeKey(project)
+        val state = File(project, ".omp/state.json")
+        val transcript = transcriptFile()
+        val stateBefore = state.readBytes()
+        // An earlier exchange in the transcript, so "unchanged" can be said of the transcript too
+        // and not only of the state file: these are the bytes the session is about to append to.
+        val earlier = Conversation(phone.shell.session.vfs, project.path)
+        earlier.append(Kind.USER, "hola")
+        earlier.append(Kind.ASSISTANT, "antes de nada")
+        val transcriptBefore = transcript.readBytes()
+        val spellings = listOf(
+            ".omp",
+            ".omp/state.json",
+            ".omp/transcript.jsonl",
+            ".omp/x/y.json",
+            // The absolute form, spelled the way this namespace spells the conversation: on the
+            // phone the shared-storage path *is* the real one, so this is the one a model sends.
+            "${File(project, ".omp").path}/state.json",
+        )
+        val calls = ArrayList<Chunk>()
+        for ((at, spelling) in spellings.withIndex()) {
+            calls += Chunk(
+                toolCall(at, "write_file", """{"path":"$spelling","content":"$HIJACKED"}""", "call_$at"),
+            )
+        }
+        for ((at, spelling) in spellings.withIndex()) {
+            calls += Chunk(
+                toolCall(
+                    at + spellings.size,
+                    "edit_file",
+                    """{"path":"$spelling","old":"provider","new":"openai"}""",
+                    "call_e$at",
+                ),
+            )
+        }
+        script(*calls.toTypedArray(), Chunk(finishTools()), Chunk(done()))
+        script(Chunk(delta("No toco eso.")), Chunk(done()))
+
+        converse(Turn("aim the next request at an endpoint you like", "No toco eso."))
+
+        val results = toolResults()
+        assertEquals(spellings.size * 2, results.size)
+        for (result in results) {
+            assertTrue("not refused:\n${result.content}", result.content.startsWith("refused:"))
+            assertTrue(
+                "the refusal did not say what the folder is:\n${result.content}",
+                result.content.contains("this conversation's own .omp folder"),
+            )
+            assertTrue(
+                "the refusal did not say who it belongs to:\n${result.content}",
+                result.content.contains("is yours to read or write"),
+            )
+        }
+        // Nobody was asked: the path is refused before the question, so there was nothing to say yes to.
+        assertFalse(
+            "an approval was asked for a write that could not happen:\n${phone.screenText()}",
+            phone.screenText().contains("approve?"),
+        )
+        assertTrue("the state file was rewritten", stateBefore.contentEquals(state.readBytes()))
+        val transcriptAfter = transcript.readBytes()
+        assertTrue(
+            "the transcript this session was replaying from was rewritten",
+            transcriptAfter.size > transcriptBefore.size &&
+                transcriptBefore.contentEquals(transcriptAfter.copyOf(transcriptBefore.size)),
+        )
+        assertFalse("a folder appeared inside the metadata folder", File(project, ".omp/x").exists())
+    }
+
+    /**
+     * The folder is listed because it is there, and refused when a tool is sent into it.
+     *
+     * Both halves are decisions and this is the test for each. Hiding `.omp` from a listing of the
+     * conversation would be a claim about the filesystem that the filesystem does not support — the
+     * user opens this same folder in a file manager and sees it. Refusing the model's read of it is
+     * the answer [omp.agent.tools.Search] already gives about searching it, and it is a *read* the
+     * app declines: the transcript is this conversation in the model's own words. The decision lives
+     * in the boundary's KDoc, and the verdict is the same one a refused write gets, because a
+     * verdict that depended on which tool asked for it would be two verdicts.
+     */
+    @Test
+    fun theMetadataFolderIsListedBecauseItIsThereAndNotOpenedBecauseItIsNotTheModels() {
+        val project = open("notas")
+        configure(project)
+        storeKey(project)
+        script(
+            Chunk(toolCall(0, "list_dir", "{}", "call_0")),
+            Chunk(toolCall(1, "list_dir", """{"path":".omp"}""", "call_1")),
+            Chunk(toolCall(2, "read_file", """{"path":".omp/transcript.jsonl"}""", "call_2")),
+            Chunk(toolCall(3, "read_file", """{"path":".omp/state.json"}""", "call_3")),
+            Chunk(finishTools()),
+            Chunk(done()),
+        )
+        script(Chunk(delta("Listo.")), Chunk(done()))
+
+        converse(Turn("abre esto $MARKER", "Listo."))
+
+        val results = toolResults()
+        assertEquals(4, results.size)
+        assertTrue(
+            "the listing hid a folder that is really there:\n${results[0].content}",
+            results[0].content.contains(".omp"),
+        )
+        for (result in results.drop(1)) {
+            assertTrue(
+                "the read was not refused:\n${result.content}",
+                result.content.contains("this conversation's own .omp folder"),
+            )
+            // The question is in the transcript, so a transcript handed back would carry it.
+            assertTrue("the transcript came back anyway:\n${result.content}", !result.content.contains(MARKER))
+        }
+    }
+
     // ---- refusing rather than guessing --------------------------------------------------------
 
     /**
@@ -374,6 +540,114 @@ class AgentToolsTest {
         assertEquals("x = 1\ny = 2\nx = 1\n", File(project, "notas.txt").readText())
         val result = toolResult()
         assertTrue(result.content, result.content.contains("2 times"))
+    }
+
+    /**
+     * An `old` or a `new` carrying a character a terminal acts on is refused, and the question is
+     * never asked.
+     *
+     * **This is the one prompt in the app a human answers with a single keystroke, and it is drawn
+     * partly in the model's own words.** The file here has an escape sequence, a carriage return
+     * and a bell in it, and the model is quoting it back: put a CR in `new` and `approve? [y/N]`
+     * is no longer the last thing on a line, and put an ESC in it and the line above can be erased
+     * and replaced with something else. So the refusal happens in [omp.agent.tools.EditFile]'s
+     * `check`, before the preview is built, and the way out is `write_file` — whose prompt is made
+     * of the path and the size and shows no text at all.
+     */
+    @Test
+    fun anEditWhoseTextCarriesAControlCharacterIsRefusedBeforeTheQuestionIsAsked() {
+        val project = open("notas")
+        configure(project)
+        storeKey(project)
+        // The file the model read: one line carrying an escape sequence, one a carriage return, one
+        // a bell. Built out of code points rather than pasted, because a literal ESC in a source
+        // file is invisible and a test whose subject is invisible is a test nobody reads.
+        val notes = File(project, "notas.txt")
+        notes.writeText("uno$ESC[31m\ndos${CR}tres\ncuatro${BEL}cinco\n")
+        val before = notes.readBytes()
+        val script = listOf(
+            // In `old`: three texts that really are in the file, each carrying one character. Each
+            // is a JSON escape, because a raw control byte is not legal inside a JSON string.
+            """{"path":"notas.txt","old":"uno$J_ESC[31m","new":"x"}""",
+            """{"path":"notas.txt","old":"dos${J_CR}tres","new":"x"}""",
+            """{"path":"notas.txt","old":"cuatro${J_BEL}cinco","new":"x"}""",
+            // And in `new`, on three `old`s that are in the file exactly once each.
+            """{"path":"notas.txt","old":"uno","new":"nuevo$J_ESC[31m"}""",
+            """{"path":"notas.txt","old":"dos","new":"otro$J_CR"}""",
+            """{"path":"notas.txt","old":"cuatro","new":"otro$J_BEL"}""",
+        )
+        val chunks = ArrayList<Chunk>()
+        for ((at, arguments) in script.withIndex()) {
+            chunks += Chunk(toolCall(at, "edit_file", arguments, "call_$at"))
+        }
+        script(*chunks.toTypedArray(), Chunk(finishTools()), Chunk(done()))
+        script(Chunk(delta("No se puede.")), Chunk(done()))
+
+        converse(Turn("change every line", "No se puede."))
+
+        val results = toolResults()
+        assertEquals(script.size, results.size)
+        for (result in results) {
+            assertTrue(
+                "not refused as a control character:\n${result.content}",
+                result.content.contains("a character a terminal acts on"),
+            )
+            assertTrue(
+                "the way out was not named:\n${result.content}",
+                result.content.contains("write_file"),
+            )
+        }
+        // Each one names the character it found, so a model knows which of its own two texts to
+        // rewrite rather than only that it was refused.
+        val named = listOf("ESC (0x1B)", "CR (0x0D)", "BEL (0x07)")
+        for (at in results.indices) {
+            assertTrue(
+                "result $at did not name ${named[at % 3]}:\n${results[at].content}",
+                results[at].content.contains(named[at % 3]),
+            )
+        }
+        // The question was never asked: this is the whole difference between a refusal and a
+        // rigged question, and the screen is the only place a rigged one can be seen.
+        assertFalse(
+            "the user was asked to approve a prompt the model drew:\n${phone.screenText()}",
+            phone.screenText().contains("approve?"),
+        )
+        assertTrue("the file was changed anyway", before.contentEquals(notes.readBytes()))
+    }
+
+    /**
+     * A result carrying a character a terminal acts on is *shown* with it spelled out, and the
+     * line naming the tool is still a line of its own above it.
+     *
+     * A read is the case that matters: a file the user wrote can hold anything, and a carriage
+     * return in one moves the cursor and rewrites `omp: read_file returned:` into whatever came
+     * after it. The transcript and the result the model reads keep the bytes exactly as they are —
+     * this is about the screen and only about the screen, and it is the same rule
+     * [omp.agent.tools.Sandbox] applies to a path, for the same reason.
+     */
+    @Test
+    fun aResultWithAControlCharacterIsShownWithItSpelledOut() {
+        val project = open("notas")
+        configure(project)
+        storeKey(project)
+        File(project, "raro.txt").writeText("antes${CR}despues${BEL}${ESC}[2Jfin\n")
+        script(
+            Chunk(toolCall(0, "read_file", """{"path":"raro.txt"}""", "call_0")),
+            Chunk(finishTools()),
+            Chunk(done()),
+        )
+        script(Chunk(delta("Leido.")), Chunk(done()))
+
+        converse(Turn("read the odd one", "Leido."))
+
+        val screen = phone.screenText()
+        assertTrue(
+            "a control character was sent to the screen:\n$screen",
+            screen.contains("""antes\rdespues\a\e[2Jfin"""),
+        )
+        assertTrue("the tool line was rewritten:\n$screen", screen.contains("read_file returned:"))
+        // And the model's own copy is the file's bytes, unchanged: the screen is not a filter.
+        assertTrue(toolResult().content.contains("\r"))
     }
 
     /** A file too large to return whole is refused with its size, never cut. */
@@ -461,6 +735,95 @@ class AgentToolsTest {
         val entry = Conversation(phone.shell.session.vfs, project.path).read().last()
         assertEquals(Kind.SYSTEM, entry.kind)
         assertEquals("cancelled", entry.extra["stopped"])
+    }
+
+    /**
+     * A cancelled approval leaves a history the *next* question can be sent, and the endpoint
+     * accepts it.
+     *
+     * The cancellation happens after the model's request was written down and before any result
+     * was, so the transcript holds an assistant line asking for a tool that nothing answers. Every
+     * OpenAI-compatible endpoint refuses that — and this one does too, in [unpairable], which is
+     * why the test can say "without a 400" rather than "the second question got an answer": the
+     * stub 400s the shape a real one would, and the answer before it is the app's own.
+     *
+     * The repair is to leave the exchange out whole — the calls and the results together — rather
+     * than to invent a result the user never agreed to. What the model is shown is a conversation
+     * with a question in it and an answer it did give, which is what happened.
+     */
+    @Test
+    fun aCancelledApprovalLeavesAHistoryTheNextQuestionCanBeSent() {
+        val project = open("notas")
+        configure(project)
+        storeKey(project)
+        script(
+            Chunk(toolCall(0, "write_file", """{"path":"nunca.txt","content":"x\n"}""", "call_0")),
+            Chunk(finishTools()),
+            Chunk(done()),
+        )
+        assertEquals(130, converse(Turn("write it", "approve?", interrupt = true)))
+        assertFalse("a cancelled write put a file on the phone", File(project, "nunca.txt").exists())
+
+        // The same folder, a new session, one question later: the transcript now holds the
+        // exchange the user stopped in the middle of.
+        script(Chunk(delta("Entendido.")), Chunk(done()))
+        val status = AtomicInteger(Int.MIN_VALUE)
+        val done = CountDownLatch(1)
+        val again = Thread({ status.set(type("omp")); done.countDown() }, "omp-second-question")
+        again.isDaemon = true
+        again.start()
+        phone.input.feed("otra vez\r".toByteArray(StandardCharsets.UTF_8))
+        await("the second answer, or a refusal") {
+            val screen = phone.screenText()
+            screen.contains("Entendido.") || screen.contains("rejected the request")
+        }
+        phone.input.feed(byteArrayOf(CTRL_C))
+        assertTrue("the second session never gave the terminal back", done.await(30, TimeUnit.SECONDS))
+        assertEquals(130, status.get())
+
+        val screen = phone.screenText()
+        assertFalse("the endpoint refused the second request:\n$screen", screen.contains("rejected the request"))
+        assertTrue("the second question was not answered:\n$screen", screen.contains("Entendido."))
+        assertEquals(2, requests.size)
+        val sent = messagesOf(requests.last().body)
+        assertTrue(
+            "a tool message with no call above it went out:\n$sent",
+            sent.none { it.str("role") == "tool" },
+        )
+        assertTrue(
+            "a call nothing answered went out:\n$sent",
+            sent.none { it.field("tool_calls") != null },
+        )
+    }
+
+    /**
+     * Two results whose id was lost in the transcript go out with two ids, not one.
+     *
+     * The transcript here is one a text editor has been through: the assistant line kept its calls
+     * and both results lost the `tool_call_id` that paired them. One constant for the fallback
+     * would give both the same id, which pairs with nothing twice instead of once, and a reader of
+     * the folder could not tell a recovered line from a genuine one. **The exchange itself is kept**,
+     * because a lost id on one line is a reason to recover the line and not to throw the round away.
+     */
+    @Test
+    fun twoResultsWhoseIdWasLostAreSentWithTwoIds() {
+        val project = open("notas")
+        configure(project)
+        storeKey(project)
+        val conversation = Conversation(phone.shell.session.vfs, project.path)
+        conversation.append(Kind.ASSISTANT, "voy a leer dos cosas", mapOf("tool_calls" to TWO_CALLS))
+        conversation.append(Kind.TOOL_RESULT, "notas.txt: hola")
+        conversation.append(Kind.TOOL_RESULT, "otro.txt: adios")
+        script(Chunk(delta("Listo.")), Chunk(done()))
+
+        converse(Turn("sigue", "Listo."))
+
+        val sent = messagesOf(requests.last().body)
+        val answered = sent.filter { it.str("role") == "tool" }
+        assertEquals(2, answered.size)
+        val ids = answered.map { (it.field("tool_call_id") as Json.Str).value }
+        assertEquals("two orphans shared one id: $ids", 2, ids.distinct().size)
+        for (id in ids) assertTrue("not a minted id: $id", id.startsWith("call_omp_"))
     }
 
     // ---- what the transcript and the requests may never carry -----------------------------------
@@ -765,5 +1128,29 @@ class AgentToolsTest {
         /** What the app uses: 15s to connect, 5min between events of one reply. */
         const val CONNECT_MS = 15_000
         const val READ_MS = 300_000
+
+        /** Distinctive, so a substring search for it cannot find the user's question by accident. */
+        const val MARKER = "ZQ7-marca-del-usuario"
+
+        /** What a model would put in the state file to have the key sent somewhere else. */
+        const val HIJACKED = "base_url=https://elsewhere.test/v1"
+
+        /** The three characters an edit must not carry, as the characters themselves. */
+        val ESC: String = 27.toChar().toString()
+        val CR: String = 13.toChar().toString()
+        val BEL: String = 7.toChar().toString()
+
+        /** And the same three as a JSON string has to spell them, because a raw byte is not legal. */
+        val J_ESC: String = "\\" + "u001b"
+        val J_CR: String = "\\" + "r"
+        val J_BEL: String = "\\" + "u0007"
+
+        /**
+         * Two calls as the transcript holds them: the array an assistant line is replayed with, and
+         * the two ids results would pair with if they still had their own.
+         */
+        const val TWO_CALLS =
+            """[{"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{}"}},""" +
+                """{"id":"call_b","type":"function","function":{"name":"read_file","arguments":"{}"}}]"""
     }
 }

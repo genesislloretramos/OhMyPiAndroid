@@ -28,9 +28,12 @@ object WriteFile : FileTool() {
         "Write one UTF-8 text file in this conversation's folder, replacing it if it is already " +
             "there. 'content' is the WHOLE file: this is not an append and not a patch, so read " +
             "the file first and send all of it back with your change in it. A path outside this " +
-            "conversation's folder is refused, and so is a directory. The user is shown the " +
+            "conversation's folder is refused, and so is the folder this app keeps its own " +
+            "transcript and configuration in, and so is a directory. The user is shown the " +
             "path, the size and whether the file is new, and is asked to approve it; if they " +
-            "decline nothing is written and you are told. Folders are not created."
+            "decline nothing is written and you are told. Folders are not created. 'content' may " +
+            "contain any character, including control characters, which is why an edit that " +
+            "carries one is refused and should come here."
 
     override val parameters = Tools.schema(
         linkedMapOf(
