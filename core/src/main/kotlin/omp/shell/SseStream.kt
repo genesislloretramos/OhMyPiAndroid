@@ -222,7 +222,9 @@ class SseStream internal constructor(
          *
          * @param connectTimeoutMs bounds the connection. The read timeout is [pollMs], which is a
          *   checkpoint and not a limit — see this class's KDoc — and the reply is bounded by
-         *   [silenceLimitMs] instead.
+         *   [silenceLimitMs] instead. [pollMs] is also the deadline for the response headers, which
+         *   is the transport's one read-timeout knob and not a choice this class gets to make
+         *   twice; the body below says what that costs.
          * @throws IllegalArgumentException if [headers] carries one name twice; nothing is sent.
          * @throws IOException for a non-2xx, carrying [omp.agent.http.HttpRefusal]'s wording. The
          *   connection is released before this is thrown.
@@ -238,9 +240,42 @@ class SseStream internal constructor(
             silenceLimitMs: Long = STREAM_SILENCE_LIMIT_MS,
             now: () -> Long = System::currentTimeMillis,
         ): SseStream {
+            // [pollMs] is deliberately *also* the deadline for the response headers, and that is not
+            // an oversight to be tidied away — it is the one knob this transport has.
+            //
+            // The read timeout belongs to the connection, and `HttpURLConnection` latches it onto
+            // the socket while parsing the status line, so it cannot be different for the header
+            // read and for the stream's reads: raising it after `connect()` changes nothing that
+            // has already been latched, and raising it before hands every read in the stream the
+            // same deadline, which turns the checkpoint into a hang wearing a timeout's clothes.
+            // `aStalledReadIsStoppedByCloseWhileTheEndpointIsStillSilent` and
+            // `aReadThatOutlivesItsBoundIsAFailedAssertionAndNotAHungSuite` are what catch that.
+            //
+            // What it costs is real and is not hidden: a server has one poll interval to start
+            // answering before this throws a bare `SocketTimeoutException: Read timed out`, the
+            // one error this class exists to never show anybody. A chat endpoint that queues and
+            // routes to a model can exceed that, and a loaded device can exceed it against a
+            // server that is local and idle. Separating the two needs a transport with a per-read
+            // timeout; `HttpURLConnection` does not have one, and pretending otherwise here is how
+            // this becomes a hang.
+            //
+            // The error is at least a real one rather than a checkpoint that has not happened yet,
+            // which is the difference between a bug report and a mystery: it names that the
+            // endpoint did not start answering, and a caller can say so to a user.
+            //
+            // **An observation, not a diagnosis.** Under heavy CPU contention this deadline is
+            // reachable against a local and idle server, because the read is a real socket read and
+            // the server's handler has to be scheduled inside it. That is one known mechanism; it
+            // is *not* the whole of the intermittent `:core:test` failure recorded below, which
+            // appeared once in seven runs of an otherwise-green 650-test suite, was never
+            // reproduced in twelve further runs at identical per-class counts, and remains
+            // unidentified. Whoever sees it again should capture the failing test's name and
+            // stack trace from `core/build/test-results/test/*.xml` before changing anything:
+            // the run that reported it is the only evidence there is.
             val conn = HttpRequests.open(url, method, headers, body, connectTimeoutMs, pollMs)
             return try {
-                SseStream(conn, HttpRequests.status(conn, url), silenceLimitMs, now)
+                val status = HttpRequests.status(conn, url)
+                SseStream(conn, status, silenceLimitMs, now)
             } catch (e: Throwable) {
                 conn.disconnect()
                 throw e
