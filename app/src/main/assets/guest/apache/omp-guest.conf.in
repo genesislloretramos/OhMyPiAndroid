@@ -1,0 +1,30 @@
+# Installed by the omp Android app, from app/src/main/assets/guest/apache/omp-guest.conf.in.
+# NOT RUN: this build has no PHP and no MySQL, and no Apache has ever read this file — it is
+# written into a Debian by omp/vm/guestapi/GuestApiTree.kt and linked in by `a2enconf omp-guest`,
+# and both of those are steps a phone runs.
+#
+# ONE directive, for ONE reason.
+#
+# app.js fetches /api/state, /api/conversations/…/transcript, …/message, /api/approvals/{id} and
+# /api/turns/{id}/cancel by absolute path, and none of them is a file. Debian's own
+# /etc/apache2/sites-enabled/000-default.conf serves this directory with:
+#
+#     <Directory /var/www/html>
+#         Options Indexes FollowSymLinks
+#         AllowOverride None
+#
+# `AllowOverride None` is the whole of the problem: an .htaccess with a rewrite rule would be read
+# by nobody, and a routing rule nobody reads is a feature that silently does nothing. This
+# directive is in the server configuration instead, where `AllowOverride` does not apply to it.
+#
+# FallbackResource is mod_dir, which is compiled into Debian's apache2 and enabled by default, so
+# this needs no module and no a2enmod — unlike php8.4, which is a package that does nothing until
+# `a2enmod php8.4` has run (that step is omp/vm/provision/GuestPackages.kt's third one).
+#
+# FallbackResource only applies to a request that names no file, which is what keeps the static
+# pages working: /, /app.css and /app.js are files in the document root and are still served as
+# themselves. index.php refuses every path that is not under /api/, so a missing static file is a
+# 404 with a sentence rather than a routing accident.
+<Directory @DOCUMENT_ROOT@>
+    FallbackResource @API_INDEX@
+</Directory>
