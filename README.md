@@ -16,12 +16,17 @@ already know:
 ```
 ls  cat  grep  find  sed  du  tree  zip  wc  sort  zipgrep …
 df  ps  top  free  uname  getprop  pm  am  dumpsys  settings  wm  screencap  curl
+vm  omp  doctor  web  grant-storage
 ```
 
 It is not a wrapper around toybox. The shell — the lexer, parser, expander, line editor and the
-terminal emulator itself — is written from scratch in Kotlin. **There is no root, no NDK, no
-bundled binary and no `Runtime.exec`.** Every command is Kotlin code running inside your app's
-own sandbox.
+terminal emulator itself — is written from scratch in Kotlin. **The shell, the VM and the agent
+are pure Kotlin, and none of them is a binary, a native library or a `Runtime.exec`.** Every
+command on this page is Kotlin code running inside your app's own sandbox. The one native
+artifact in the APK is `proot`, a GPL path emulator taken from Termux's packages, and it exists
+for one reason: a real Debian is a real Linux userland and it has to be emulated rather than
+reimplemented. **The native helper** below has the bytes, the licences and the source offer; it
+has never been run on a device.
 
 ```
 $ ls /proc | head -3
@@ -48,8 +53,18 @@ export ANDROID_HOME="$HOME/Android/Sdk"
 echo "sdk.dir=$ANDROID_HOME" > local.properties
 
 ./gradlew :app:assembleDebug     # app/build/outputs/apk/debug/app-debug.apk
-./gradlew :core:test             # 575 tests: the shell's whole behaviour, on the JVM, in about half a minute
+./gradlew :core:test             # 803 tests: the shell, the VM, the agent and the guest, on the JVM
+./gradlew :app:testDebugUnitTest # 101 tests: the web server, the WebView policy, the helper
 ```
+
+Both suites are green as written, and neither needs a device. `:core:test` is 803 tests in 39.3
+seconds of execution and 49 seconds for the whole `--rerun-tasks` run with the Kotlin recompile.
+`:app:testDebugUnitTest` is 101 tests in 0.7 seconds of execution and about two seconds of
+Gradle — it is small because the only thing in `:app` with behaviour worth testing is the
+loopback server, the policy around it and the names of the native helper. The debug APK is
+2,294,381 bytes, and two builds of the same tree are byte-identical. `--rerun-tasks` cannot be
+used on `:app`: it forces
+`:app:compileDebugNavigationResources`, which is not in the offline build cache.
 
 ## Use it
 
@@ -65,7 +80,10 @@ away even if your keyboard eats it.
 - **Back** stops a running command; press it twice to exit. `Ctrl-D` on an empty line also exits.
 - **Ctrl-C** cancels whatever is running.
 
-- There is a second shell inside this one — see **The VM**, below.
+- There is a second shell inside this one — see **The VM**, below — and a real Debian on the
+  other side of `omp provision` — see **The guest**. `omp` opens the conversation list;
+  `omp doctor` prints everything this build can read about the device; `web` prints the chat
+  server's address; `grant-storage` asks for the all-files grant the conversations need.
 
 ### Some commands are deliberately missing
 
@@ -83,12 +101,19 @@ Android does not let an app do these things, and this shell would rather say why
 
 `help` lists all of them with the same one-line reasons.
 
+That table is about the **phone** shell, and it is still true of it. Inside the VM `su` and
+`sudo` do exist, and both say in the place you are looking that nothing was escalated —
+`docs/vm.md` has the sentence they print. They exist to be honest about the boundary, not to
+cross it.
+
 ## The VM
 
 There is a second shell inside this one. It is an **in-process userspace VM** — Ubuntu Server
 24.04.1 LTS, minimal, running on a directory in the app's own storage. No image to download, no
-kernel to boot, no native code, no `Runtime.exec`, and no root: every command in it is the same
-Kotlin the phone shell runs, with a different `Vfs` behind it.
+kernel to boot, no process, no native code and no `Runtime.exec`: every command in it is the same
+Kotlin the phone shell runs, with a different `Vfs` behind it. That is the whole of it, and it is
+why this is not the same thing as the real Debian in **The guest**, below — the two are different
+products and they are both here.
 
 ```
 $ vm
@@ -130,6 +155,194 @@ It is not a hypervisor, not QEMU, not an emulator and not a container. There is 
 is no second uid to escalate to and no memory isolation: `root` inside the VM is a **name the VM
 kernel answers to**, which is why the real one is one `cat` away in `/sys/omp/android/uid`.
 `docs/vm.md` has the design and the limits in full.
+
+## The guest
+
+The VM above is written in Kotlin and lives in this process. The guest is the other thing: **a
+real Debian**, downloaded and unpacked on the phone, with a real `omp` in it on the two ABIs that
+upstream builds one for.
+
+```
+$ omp provision
+omp: arm64-v8a: 334.2 MiB (350,458,048 bytes) over the network — 55.7 MiB (58,379,360 bytes) of
+Debian trixie rootfs and 224.0 MiB (234,866,984 bytes) of the omp v18.3.4 agent binary, and
+54.6 MiB (57,211,704 bytes) of LAMP that apt fetches inside the Debian after the rootfs is
+unpacked. It needs 710.9 MiB (745,403,584 bytes) of room on the device, of which 376.7 MiB
+(394,945,536 bytes) is LAMP installed.
+omp: the Debian is provisioned with LAMP from the Debian archive at first boot, not bundled in
+this app: apache2-bin, libapache2-mod-php8.4, php8.4-cli, mariadb-server and their dependencies,
+installed by apt inside the guest once the rootfs is unpacked, for 54.6 MiB (57,211,704 bytes)
+over the same mobile connection and 376.7 MiB (394,945,536 bytes) on the device, both measured,
+and not started without you asking. […]
+omp: into /data/user/0/com.omp.terminal/files/omp, with a download in progress kept in
+/data/user/0/com.omp.terminal/files/provision so a cancelled run continues instead of starting again
+
+omp: type y to download that now, or anything else to stop:
+```
+
+**Nothing moves without an answer given in that run.** The cost is printed from the manifest
+itself, and only a `y` — not an empty Enter, not `yes` — is the agreement. On a pipe, in a script,
+under a `&`, or inside the VM, there is no question to answer and the command prints the cost and
+the refusal and stops. `--yes` is the one exception: it is this run's own argument, and it says
+in the output that it skipped the question. A download can be cancelled with Ctrl-C and resumed —
+the `.part` file's own length is the offset the next run asks for.
+
+**What it is on your device, and what it is not.** arm64 gets a Debian and the real agent; amd64
+gets a Debian and the real agent; armhf gets a Debian and **no agent**, because upstream ships no
+32-bit Linux build of `omp`; x86 gets **nothing**, because Debian publishes no netboot image for
+i386. Those last two are refused before a question is asked, in a sentence that says which.
+
+The two LAMP figures are measured **for arm64 only**; the other three ABIs print that nothing has
+been measured for them and that the real first-run cost is therefore larger than the number above
+it, rather than a number borrowed from arm64. The room check is a floor for the same reason: what
+crosses the connection plus what the packages are measured to occupy once installed, and the
+Debian's own unpacked size is not estimated.
+
+**`omp provision` downloads, verifies and unpacks. Starting the guest is a separate step, and it
+happens at every start of the app rather than at provisioning.** On a provisioned device the app
+reserves a port, links the guest's Apache configuration in, starts Apache in the foreground,
+asks whether a page actually comes back, runs the boot's `omp update`, and writes down which of six
+states that was. It is idempotent — a rotation asks again and gets the same answer, because the
+first run's Apache is holding the port and a second would be a collision with itself.
+
+**The guest's own `apt` install of Apache, PHP and MariaDB is the one step in that sequence this
+build does not take.** The sequence links a configuration drop-in into an Apache and starts it; the
+`apt` step that would put Apache on the disk in the first place is written, priced, measured and
+tested against a fake launcher, and nothing in the app calls it. **A device provisioned today
+therefore has a Debian without Apache on it, and the guest start will reach `APACHE_NOT_ANSWERING`
+and say so.** The state is the honest answer rather than a page from somewhere else, and that is
+what the six states are for.
+
+**The port is 8732, one above this app's own 8731.** proot gives the guest no network namespace, so
+a listener inside the Debian holds a socket in the *phone's* loopback and is reachable by every app
+on the device — which is why the number cannot be one somebody hopes is free. Three alternatives
+were weighed and rejected: *discovering* the port from the guest's own configuration, because
+Apache does not report the port it chose and the value would be a round trip through a file this
+build had just written; *negotiating* it, because there is nobody to negotiate with — the guest is
+Debian's own Apache under a path emulator, with no init and no socket this app may talk to
+before the server exists; and an *ephemeral* port, which Apache cannot take because it binds a
+number in a file, so "ephemeral" here would be a guess wearing a constant's name. One number, one
+place, and a check immediately before use.
+
+**The port is bind-checked immediately before Apache is started, and a port that is taken is the
+named state `PORT_TAKEN`.** Nothing is launched, no guest origin is constructed, the app's own
+server is shown — **and the report says, in those words, that it is the app's own server.** That
+is the lie this whole path exists to prevent: a quiet fall back would tell a user the real agent was
+answering while the Kotlin one was, and every decision taken from that screen would be about the
+wrong program.
+
+**A guest origin becomes eligible only after a positive probe, not because the guest was
+launched.** The bind check is a check, not a lock — this app closes its socket before Apache is
+told the number — so after Apache starts, a `GET /` for this build's own document marker is asked
+up to six times, half a second apart. Taken with the bind check, that establishes two things and no
+more: the port was free immediately before Apache was started, and an HTTP server is answering on
+it now and serving *this app's* page rather than something else that happens to listen. It does
+**not** establish that the thing answering is this install's process — a second profile of this
+app is a real case, both serve byte-identical pages, and no content check can tell them apart. What
+rules that out is the bind check, because a second profile's Apache is *already listening* on the
+reserved number. The residual race is named rather than hidden: another process binding the same
+number in the window between the check closing and Apache binding it. That window is a few
+milliseconds and nothing here can close it, and the consequence of losing it is the safe one — the
+probe fails, the state is `APACHE_NOT_ANSWERING`, and the app's own server is shown *and named as
+the app's own server*.
+
+**The six states, which are the report as much as the behaviour.** `NO_DEBIAN` and `NOT_STARTED`
+are not serving. `PORT_TAKEN` and `APACHE_NOT_ANSWERING` are not serving, and both refuse the
+guest's origin rather than replacing it. `AGENT_UPDATE_FAILED` and `UP` **are** serving, and the
+whole difference between them is the agent inside. `AGENT_UPDATE_FAILED` is the one a reader needs
+the wording of: **the page is the Debian's and the agent inside it is the one that was already
+there, and that is not a failure of the page.** A guest whose agent is out of date is still a guest
+serving a page, and showing this app's Kotlin server instead would trade a real page from a Debian
+for a page from the app on the strength of a version number.
+
+**Apache is started before the boot's `omp update` runs, and the update gates nothing on the web
+half.** A phone on a radio where the check takes the full minute would otherwise show nothing for a
+minute and then a page, and taking the `&&` seriously enough to leave the guest down on a failed
+update would turn a failed update into a device with nothing on it. So the agent is the last thing
+here: Apache, its PHP, its filesystem and the `web` command come up whether or not the update did.
+
+**Nothing in this repository has ever run the guest, the native helper or the real agent on a
+phone, an emulator or a test, and proot itself has never been executed in this environment at
+all** — no device, no emulator, no ARM Android. The one line of the whole guest start path that can
+only ever run on a phone is `ProotForegroundServer.launch`'s builder start, and the source marks it
+as such. **Everything above it** — the argument vectors, the environment, the port check, the
+probe, the record and every sentence of every report — is plain JVM and is covered by tests. A
+helper present in an APK is not a helper that has run, and `omp doctor` says so in its own closing
+line. Everything this document says about the guest's web half is a statement about code that has
+been read and tested, not about a guest that has answered.
+
+What is on the disk after a successful `omp provision` is real, and worth looking at: the unpacked
+Debian under `files/omp/rootfs`, the agent at `files/omp/bin/omp`, and this app's three chat files
+written into the guest's `/var/www/html` — the same three bytes `app/src/main/assets/web/` holds,
+read once, so the guest's document root is not a second copy somebody has to remember to update.
+
+**`omp doctor` is the command that answers "it does not work".** It is read-only, it starts no
+download and writes no file, and it prints ten sections — `identity`, `guest`, `helper`,
+`provisioning`, `guest state`, `agent update`, `guest origin`, `chat`, `gaps`, `next` — in a fixed
+order, one `key: value` per line, so two runs can be diffed and one can be pasted into a bug
+report whole. `agent update` is what the last boot's `omp update` did; `guest origin` is which of
+the six states the last start of the guest reached, and it reads a file rather than a socket, so
+the read-only promise holds. `docs/vm.md` has the section-by-section reading of the output, and the
+closing line of that page says what a green report still cannot tell you.
+
+### The guest's own agent, and what it cannot do
+
+Everything above this point describes the Kotlin agent in this build. The Debian carries a
+different one — the real upstream `omp` — and the two are not interchangeable.
+
+**`omp update` runs in the guest at every start of the app, and the `&&` in `omp update && omp` is
+preserved literally.** The vector is exactly `/usr/local/bin/omp update` and **no flags at all**,
+taken from the real binary's own help text — none of `-c, --check`, `-l, --plugins`, `--canary` or
+`--stable` is what a boot wants, because the user wrote `omp update && omp` and the agent is to
+*become* current, not to be asked whether it is. A flag this build cannot quote from a help text is
+a flag that silently does nothing on a phone, and a test fails if a flag-shaped token ever appears
+in that vector.
+
+**Six named outcomes, and they are not a shrug.** `NOT_PROVISIONED` and `NO_AGENT` (both exit 0)
+mean the update did not run and must not read as though it failed; `UPDATED` and `ALREADY_CURRENT`
+(both 0) mean it landed; `FAILED` is 1 with the guest's own last line recorded; and `TIMED_OUT` is
+**124 — the shell's own number for a command that had to be killed**, a status no `omp` exits with,
+so "we stopped it" can never be read as "it failed". **Only `UPDATED` and `ALREADY_CURRENT` let
+the guest's `omp` start.** Everything else reports the Kotlin agent, which is the correct answer
+when the update did not work — a different program, honestly named, rather than a stale one.
+
+**The bound is 60 seconds, and the reason is arithmetic.** The measured fast path is 0.48–0.58 s
+and the measured dead-network path is 0.23 s, so a minute is a hundred times anything this build
+has ever seen, and short enough that a start of the app is a start of the app. **It is deliberately
+not long enough to cover a real install.** A 224 MB binary on a phone radio is minutes, and the
+consequence is stated rather than hidden: an update that is genuinely downloading is stopped at the
+bound, recorded `TIMED_OUT` with whatever the guest last said, and run again at the next boot. The
+alternative is minutes of a `WebView` waiting on a radio, which is the hang the bound exists to
+prevent.
+
+**It runs unattended, and that was measured rather than assumed.** `omp update < /dev/null` on the
+real binary behaves identically to the interactive form — the same two lines, exit 0, no keypress
+and no prompt. Running it twice in a row is also safe and leaves nothing behind, so a boot that
+runs it on every start is not a boot that accumulates processes.
+
+**What a successful install prints, how long it takes, and whether a partial download resumes are
+not established by this build.** The machine this was measured on was already current, so
+"Already up to date" is the only success that has ever been observed here, along with the
+no-network failure. Nothing in this app reads a line naming a newly installed version, and the
+before-and-after in the record is assembled from two boots' own reports rather than invented from
+one. It must not appear to have watched an update land.
+
+**The guest's agent is read-only, and that is a measured result rather than a preference.** The
+page has an approval dialog and there is an `/api/approvals/{id}` route, because this app's own
+agent puts every write to the user. Three runs of the real binary were measured, and the guest
+cannot do it: with nothing asked, the `write` tool **ran and the file was created**; with
+`--approval-mode always-ask` the question was asked on a stream that was **at end of input**, so
+every answer read as a decline. A pipe the guest holds open makes the agent wait before it starts
+at all, and a closed one is the only standard input a child of a PHP process can be given here.
+The host protocol that would fix this is `--mode=rpc`, and **this build establishes nothing about
+its messages**, so it is not used. The guest therefore passes `--approval-mode write`, and the
+**cost is stated plainly: the guest's agent is read-only until a question can reach a person, and
+`/api/approvals/{id}` answers every id with the app's own 404 sentence.**
+
+**The guest's question arrives on standard input and is written there, not as an argument.** The
+positional form would make a question beginning with `@` a *file to include*, read out of the
+working directory — and a chat box must not be a way to name a file for the model. The guest
+writes the question on standard input and closes it, and `@` means nothing there.
 
 ## Conversations
 
@@ -206,6 +419,13 @@ outside the VM namespace and outside `Documents/omp`, so no path the agent can r
 `omp key --show` names the provider, the file and a byte count; there is no code path from it to
 the secret.
 
+**It is in the app's private storage, and it is not encrypted at rest.** A file under `files/` is
+unreadable by other apps and by a file manager, and that is the whole of the protection: anything
+running as this app's uid — a debuggable build, an `adb backup`, a root shell — reads the
+plaintext. There is no `KeyStore`-backed wrapping of the model key, and no part of this app claims
+one. The file is written 0600 through a scratch file and a rename, so a reader sees the whole old
+key or the whole new one, and never a key under a wider mode.
+
 ```
 $ omp key                     # prompted, echo off
 $ omp key --show              # provider, file, byte count
@@ -264,29 +484,109 @@ a conversation. One question gets at most ten tool rounds, and hitting that is s
 written to the transcript rather than being silent.
 
 `omp update` deliberately prints no progress bar, no version check and nothing that implies a
-download, because nothing in this app can download anything. It reports the version, the provider,
-the endpoint, the model, the key's file, and the transcript's size against its cap.
+download, because nothing in this app's *agent* can download anything. It reports the version, the
+provider, the endpoint, the model, the key's file, and the transcript's size against its cap. (The
+one thing in this app that does download is `omp provision`, and it is a verb of the launcher, not
+of the agent.)
 
 `omp ls` lists and changes nothing. `omp rm NAME` refuses without `--force`, printing the real path
 and what is under it first, and says so again for a folder this app did not make. Ctrl-C at the
 prompt cancels it: no half-created folder, no session moved.
 
-Outside a conversation, `omp update` says in three lines that there is nothing to report yet and how
-to make something to report, and opens no folder.
+Outside a conversation, `omp update` says in three lines that this is not a conversation and how to
+make one, adds a fourth that it downloaded nothing, and opens no folder. It is an agent verb and
+not a launcher one, so it is never confused for a conversation called `update` — and the price,
+stated plainly, is that `run`, `update`, `key` and `help` are unopenable as conversation names
+everywhere.
 
 The whole thing needs the all-files grant, because `Documents` does. Without `grant-storage` it
 says exactly that and creates nothing — not a folder that looks like it worked. And on a pipe, in
 a script or under `vm exec`, `omp` prints the list and the two options and returns, rather than
 waiting forever for a keypress that is never going to arrive.
 
+### The same agent, in a browser
+
+There is a second door into the same agent: a browser on this phone. Every time the app opens, a
+foreground service starts a small HTTP server on `127.0.0.1` and puts its address on a
+notification. A browser pointed at that address gets the same agent, the same conversations and
+the same five tools, as a chat. Closing the app does not stop it; the notification's **Stop** does.
+
+**The terminal and the chat are two views of one Activity, and which one is on screen is decided
+by which server answered.** The app carries a `WebView` and loads the chat into it on every
+launch; it is *displayed* only when the origin in force is the guest's Apache inside the Debian,
+and the terminal is shown otherwise. **A guest that comes up while you are in the terminal takes
+the screen, and Back gives the terminal straight back** — the shell keeps running, and any command
+in it keeps running, so the switch costs a glance and not a session. The decision is made once,
+after the guest start has resolved, from four values: what is on the disk, the token, the published
+URL, and whether a request for this build's own chat document came back from the guest's port. A
+page cannot reach that decision, cannot cause it to be made twice, and cannot affect what it
+returns. `docs/vm.md` has the line in `omp doctor`'s `chat` section that says which origin was
+chosen and why.
+
+The URL is on the notification in full, token included, because a loopback URL nobody can open is
+not a URL. `web` in the terminal prints the same address, says whether anything is accepting on
+that port, and names where the conversations are; `web stop` ends the service and gives the port
+back.
+
+**The token is the whole of the authentication, and it is a real boundary with a real edge.** A
+loopback port is reachable by every app on the device, so without one, any of them could read your
+conversations and spend your key. With one, a request that does not carry it is a `401`. What it
+is not is a defence against a rooted phone or against you: anyone who has the notification, or a
+photograph of it, has the token. The whole of that is written on `TokenGate`, and it is written the
+way it is rather than the way it would sound better.
+
+**A write is still put to you, and the prompt does not go away.** The browser's approval dialog has
+no way out except its two buttons: not a tap on the backdrop, not Escape, not a timer. That is the
+same rule the terminal follows, arrived at through the one byte `omp.agent.Session` reads for its
+own question — the web server supplies that byte when you answer, and there is no route, setting or
+URL that turns the question off.
+
+`web` asks the port rather than a file, so it cannot print a URL that stopped answering: a
+service the user stopped from its notification takes the socket with it, and the command says
+"not running" instead of handing out a dead address.
+
+The server is written from scratch, like everything else here: a `ServerSocket`, a small parser,
+eleven routes, a fixed pool of four threads, a 5-second read timeout, a 64 KiB body cap, and a
+`LocalServerTest` that drives it over a real loopback socket on the JVM. **No HTTP library, no
+framework, no WebSocket** — a streamed answer is server-sent events, which is the grammar
+`omp.agent.http.Sse` already parses on the client side, so the stream the phone writes is one the
+app's own code can read.
+
+**Which server answers needs two facts and not one.** The app's own server for the Kotlin agent
+that is in this build, and Apache inside the Debian for the real one — but naming the guest's port
+is necessary and not sufficient, and the difference is the whole of the rule: **the guest's origin
+is built only after a request for this build's own chat document has come back from it.** A Debian
+that was downloaded is not a guest that is answering, and a server on a port is not this build's
+guest either. A build that named the port and stopped there would hand a `WebView` an address that
+never loads on every device where the guest did not come up — and, where something else held the
+number, a chat from a program the user was never told about. Both answers are real; neither is a
+fallback in the sense of being embarrassing, because the Kotlin agent is the only agent a 32-bit
+device can ever have.
+
+**The token gets in the one way that works for both.** The app appends it to the URL it hands the
+`WebView`; the page exchanges it for a cookie. Nothing guest-side has to know this app's token for
+that to work, which is the point: the API side of the guest is a question that has not been
+answered, and this half does not pre-empt it.
+
+**A `WebView` renders whatever HTML the page sends, and the page can come out of a Debian the
+user can `apt install` into.** That is inherent in serving the UI from a guest and it is not
+mitigated here, because it cannot be. What is bounded is what the page can reach: no JavaScript
+bridge, `file://` and `content://` off, mixed content off, and every URL that is not this origin's
+own scheme, host and port refused — for subresources as well as navigations, because a page that
+may only *navigate* to its own origin can still exfiltrate through an `<img>`. JavaScript is on,
+because a chat is JavaScript, and that is the honest cost: the boundary is the network one, not
+the scripting one.
+
 ## Permissions
 
 | permission | why |
 |---|---|
 | `MANAGE_EXTERNAL_STORAGE` | to browse shared storage. Not granted at install: run `grant-storage`, or tap the hint in the prompt. |
-| `INTERNET` | `curl` |
+| `INTERNET` | `curl`, and the model's endpoint |
 | `QUERY_ALL_PACKAGES` | without it `pm list packages` returns almost nothing on Android 11+ |
 | `KILL_BACKGROUND_PROCESSES` | `am force-stop` |
+| `FOREGROUND_SERVICE` | the chat server outlives the Activity. It is a `specialUse` service, not `dataSync`: Android 14 caps `dataSync` at about six hours a rolling day and then stops it, which is the opposite of a server that should be up whenever the app is. `ChatServiceManifestTest` holds the manifest and the `startForeground` call to the same type, because a mismatch between them kills the app on launch with a stack trace about a type. |
+| `POST_NOTIFICATIONS` | without it the notification that shows and stops the service is not shown on API 33+ |
 
 **This is not a Play Store app.** All-files access and package visibility are both restricted by
 Play policy. It is a sideloaded developer tool; the release APK here is debug-signed.

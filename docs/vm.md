@@ -31,8 +31,10 @@ create in there is a file.
 
 ## What it is not
 
-- **Not a hypervisor and not QEMU.** There is no second CPU, no guest memory, no `KVM`, no ELF
-  binary anywhere in the app. There is no NDK and no `Runtime.exec`.
+- **Not a hypervisor and not QEMU.** There is no second CPU, no guest memory and no `KVM` **in
+  this namespace**, which is Kotlin: a `Vfs`, a process table and some generated filesystems, in
+  this process. The real Debian on the other side of `omp provision` is a different thing
+  entirely, and it does have an ELF binary under it — see **The guest** in README.md.
 - **Not a container.** There is no second uid, no mount namespace in the kernel's sense, and no
   `CAP_` anything. The boundary is a `Vfs` object.
 - **Not isolated.** One process, one heap. `root` inside the VM is a name the VM kernel answers to,
@@ -259,9 +261,256 @@ identity and is not a machine id, and `/etc/resolv.conf` says "no route" when th
 no DNS. Each of them says so in its own content. A userland that lied in its own configuration
 files would be worse than one that admits what it is.
 
+## `omp doctor` — reading the output
+
+`omp doctor` is the one command that answers "it does not work". It reads the live platform and the
+live filesystem and prints a fixed set of sections in a fixed order, one `key: value` per line, so
+two runs can be diffed and one can be pasted into a bug report whole.
+
+**It is read-only.** It starts no download, writes no file, and opens exactly one socket: a
+400 ms connect probe against the loopback port the chat service published. It says so in its own
+`help` line. The ten sections are `identity`, `guest`, `helper`, `provisioning`, `guest state`,
+`agent update`, `guest origin`, `chat`, `gaps` and `next`, and they print in that order every time.
+The two new ones — `agent update` and `guest origin` — read **files** rather than the network, and
+that is deliberate: `omp doctor` runs in a different process from the one that started the guest,
+possibly after a reboot, and the fact that answers "is the guest up, and is it the one answering"
+has to have survived on the disk.
+
+**The `origin:` line is the one to read first, because it is the whole of "which agent is
+answering".** The WebView is handed the guest's Apache inside the Debian when a whole rootfs and
+the real agent are both on the device **and the last start of the guest saw this build's own chat
+document come back from the guest's port**; the app's own loopback server otherwise. Both branches
+are real and neither is a fallback in the sense of being embarrassing — the Kotlin agent in this
+build is the only agent a 32-bit device can ever have. **Naming the port is necessary and not
+sufficient**: a Debian that was downloaded is not a guest that is answering, and a build that
+stopped at the port would hand a `WebView` an address that never loads wherever the guest did not
+come up. Read it together with the `guest origin` section above it, which says which of the six
+states the last start reached and why the app settled on the origin it did.
+
+**The unprovisioned case is the one this build can show on its own.** A device with no Debian, or
+one that has not started the guest, reports `this app's own loopback server:` and one of the
+reasons — and the sample below is a device that got all the way to `UP`, which is a reachable state
+and not a hypothetical one.
+
+
+A healthy, fully provisioned arm64 phone:
+
+```
+$ omp doctor
+omp doctor: read-only — nothing below downloads, writes, starts or stops anything
+
+identity
+  app:           com.omp.terminal
+  version:       1
+  installed at:  /data/app/~~kQ==/com.omp.terminal-1==/base.apk
+  build:         google/shipped/panther:14/AP1A.240505.004/11269751:user/release-keys
+  uid:           10345
+  gid:           10345
+  abi:           arm64-v8a
+  debian arch:   arm64
+  real agent:    obtainable on arm64-v8a: omp-linux-arm64, 224.0 MiB (234,866,984 bytes)
+
+guest
+  payload:       /data/user/0/com.omp.terminal/files — exists, 2 entries
+  exec dir:      /data/app/~~kQ==/com.omp.terminal-1==/lib/arm64 — exists, 5 entries
+  wire:          334.2 MiB (350,458,048 bytes)
+  room:          710.9 MiB (745,403,584 bytes)
+  space check:   would pass: 41.2 GiB (44,239,986,176 bytes) is free and the manifest asks for 710.9 MiB (745,403,584 bytes)
+
+helper
+  expected:      libproot.so, libproot-loader.so, libproot-loader32.so, libtalloc.so, libandroid-shmem.so
+  libproot.so:   247408 bytes
+  libproot-loader.so: 18136 bytes
+  libproot-loader32.so: 6244 bytes
+  libtalloc.so:  31440 bytes
+  libandroid-shmem.so: 14432 bytes
+  verdict:       all 5 are there, which is as far as this build can check
+
+provisioning
+  state file:    /data/user/0/com.omp.terminal/files/provision/state — not there
+  debian-trixie-rootfs-arm64: complete, unpacked at /data/user/0/com.omp.terminal/files/omp/rootfs
+  omp-linux-arm64: complete, unpacked at /data/user/0/com.omp.terminal/files/omp/bin/omp
+  last attempt:  no record at /data/user/0/com.omp.terminal/files/provision/state: nothing has been downloaded by this build
+  last run:      none recorded in this app's memory, which does not survive a restart; the state file and the .part files above are the only evidence there is
+  phase:         installed: nothing in progress
+
+guest state
+  rootfs:        unpacked, .omp-provisioned is in /data/user/0/com.omp.terminal/files/omp/rootfs
+  agent:         installed at /data/user/0/com.omp.terminal/files/omp/bin/omp
+  web root:      installed at /data/user/0/com.omp.terminal/files/omp/rootfs/var/www/html
+  web bytes:     3 of 3 are this build's own copy — index.html is this build's own copy; app.css is this build's own copy; app.js is this build's own copy
+  lamp:          not installed: no .omp-guest-packages in /data/user/0/com.omp.terminal/files/omp/rootfs
+
+agent update
+  record:        /data/user/0/com.omp.terminal/files/provision/update — 164 bytes
+  outcome:       ALREADY_CURRENT: 'omp update' ran and said the agent was already current, so nothing was downloaded
+  version:       18.3.5 is what the guest reported for itself
+  last run:      at 2026-09-28 07:41:12 UTC, status 0, bound 60000ms
+
+guest origin
+  state:         UP: Apache inside the Debian is answering on http://127.0.0.1:8732 and the boot's 'omp update' landed, so the page the WebView was handed is the Debian's
+  port:          8732, reserved by the run that started the guest: it was free, and it was given back so Apache could take it
+  apache:        answering: the start asked http://127.0.0.1:8732 for this build's own chat document and got it back
+  agent:         ALREADY_CURRENT: the boot's 'omp update' landed at the same start, so the agent the Debian's page is talking to is the one it was brought up to; the 'agent update' section above has what it printed
+
+chat
+  origin:        the guest's Apache inside the Debian: a whole rootfs and the real agent are both on this device, and the run that started the guest saw this build's own chat document come back from http://127.0.0.1:8732
+  port:          8731, from /data/user/0/com.omp.terminal/files/web/url
+  listening:     yes, something accepted a connection on 127.0.0.1:8731 inside 400ms
+  token:         /data/user/0/com.omp.terminal/files/web/token — 43 bytes — read, never printed by this command
+
+gaps
+  none: every fact above was read from this device
+
+next
+  web: the agent's web front end is up on 127.0.0.1:8731; 'web' prints that url and this install's token
+
+  what this cannot tell you: nothing above executed the native helper. "the helper is
+  there" is not "the guest will boot", and no build of this app has ever run proot on any
+  device. The next failure after a report that reads healthy is the kernel refusing to
+  exec a file out of the exec directory, a proot that will not accept these flags, or a
+  Debian that unpacked without a loader in it.
+```
+
+#### The lines that matter most
+
+| line | what it settles |
+|---|---|
+| `verdict:` under `helper` | whether the package manager extracted the native helper at all. **This is the single most useful line in the command**, because an unextracted helper is the most likely first-install failure and its symptom — a directory that exists and is empty — looks from a shell like a device with no proot on it. |
+| `space check:` | whether `omp provision` would refuse before its first byte, answered with the manifest's own two numbers. |
+| `web bytes:` | whether the guest is serving *this build's* chat UI, and which of the three files is not. |
+| `origin:` and `listening:` | which server the WebView was handed, by name, and whether the app's own port is accepting right now. |
+| `state:` under `guest origin` | which of the six the last start of the guest reached. **`AGENT_UPDATE_FAILED` is a serving state and not a fault**: the page is the Debian's and the agent inside it is the one that was already there. |
+| `outcome:` under `agent update` | what the last boot's `omp update` did, by name — and `TIMED_OUT` there is the shell's own killed-command number, so it can never be read as the command having failed. |
+| `last attempt:` and `last run:` | the resume record from the disk, and the outcome the running app holds in memory. |
+| the closing line | what this command **cannot** tell you. Read it before concluding anything from a green report. |
+
+**A `guest origin` state of `UP` is not a statement that a guest booted.** It says this build's own
+document came back from the reserved port and that the boot's `omp update` landed. It does not say
+which of them did the work, and it cannot: every fact in the two new sections is read off a file
+this app wrote, and none of them is an `execve`.
+
+### Five situations you will actually hit
+
+#### 1. The helper was never extracted
+
+```
+helper
+  expected:      libproot.so, libproot-loader.so, libproot-loader32.so, libtalloc.so, libandroid-shmem.so
+  libproot.so:   unreadable: not in /data/app/~~kQ==/com.omp.terminal-1==/lib/arm64 (No such file or directory)
+  …
+  verdict:       none of the 5 packaged files is in /data/app/~~kQ==/com.omp.terminal-1==/lib/arm64: the package manager did not extract them, and android:extractNativeLibs="true" is the attribute that makes it
+```
+
+**What it means.** The APK carries the helper; the install did not put it on the device. The
+`exec dir` line above it will read `exists and is empty`, which is the signature of this and only
+this. AOSP's extractor keeps a `lib/<abi>/` entry only if the name starts with `lib` and ends in
+`.so`, and `android:extractNativeLibs="true"` is what makes it copy them at install time at all.
+There is nothing the app can do about it from inside itself, and the honest answer names the
+attribute rather than suggesting the user try again.
+
+#### 2. A download stopped half way
+
+```
+provisioning
+  state file:    /data/user/0/com.omp.terminal/files/provision/state — 41 bytes
+  debian-trixie-rootfs-arm64: complete, unpacked at /data/user/0/com.omp.terminal/files/omp/rootfs
+  omp-linux-arm64: partial, 12.0 MiB (12,582,912 bytes) of 224.0 MiB (234,866,984 bytes); the next run continues from there
+  last attempt:  omp-linux-arm64, recorded as '12582912 partial'
+  phase:         downloading: 1 artifact(s) have a .part file, and the next 'omp provision' resumes each from that file's own length
+```
+
+**What it means.** A radio dropped a 224 MB transfer, which on a phone is the normal case and not
+an edge. Both byte counts are printed because the `.part` file's own length *is* the offset the
+next run asks the server to resume from — so the number is the resume point, not an estimate.
+Running `omp provision` again continues from exactly there. `last run:` is the app's in-memory
+record of how the run ended and says so when there is none, because it does not survive a restart
+and the disk is then the only evidence there is.
+
+#### 3. The guest is up but the page is somebody else's
+
+```
+guest state
+  web root:      installed at /data/user/0/com.omp.terminal/files/omp/rootfs/var/www/html
+  web bytes:     2 of 3 are this build's own copy — index.html is 53 bytes here and 35 bytes in this build: different bytes; app.css is this build's own copy; app.js is this build's own copy
+```
+
+**What it means.** The Debian's own `apache2` package ships an `index.html` and overwrites the one
+this build put there when it was installed. Both lengths are printed so the difference is visible
+rather than asserted, and the file is named, because one stale page out of three is exactly what
+this looks like and "the web root is broken" would not have said which file. `omp provision` puts
+the app's own copy back.
+
+#### 4. Nothing is listening
+
+```
+chat
+  origin:        this app's own loopback server: a whole rootfs and the real agent are not both on this device
+  port:          8731, from /data/user/0/com.omp.terminal/files/web/url
+  listening:     no, nothing accepted a connection on 127.0.0.1:8731 inside 400ms
+```
+
+**What it means.** The service published a URL and then stopped — a user who pressed **Stop** on
+the notification, or an app that was killed. The file records that the service *started*; it does
+not record that it is still here, so the port is asked and not read. A refused connect is an
+answer, and it is why the `web` line is absent from `next` below: advice that does not follow from
+what was just read is not advice.
+
+#### 5. Something else on the phone holds the guest's port
+
+```
+guest origin
+  state:         PORT_TAKEN: something on this phone already holds http://127.0.0.1:8732, so Apache was not started at all, and the Debian's origin was refused rather than replaced by this app's own server
+  port:          8732, and the run that started the guest could not reserve it: something on this phone already held it, so Apache was never started on it
+  apache:        not started: the start launched nothing inside the guest
+```
+
+**What it means.** The reserved number — 8732, one above this app's own 8731 — was not free, so
+nothing was launched and **the guest's origin was refused rather than replaced**. That refusal is
+the point: a quiet fall back to the app's own loopback server would tell a user the real agent was
+answering when the Kotlin one was, and every decision they took from that screen would be about
+the wrong program. The state is named, and `chat` below it says the same thing in its own words.
+
+### `unreadable:`, and what the gaps section is for
+
+**A fact this run could not read is printed as `unreadable: <reason>` and named again in the
+`gaps` section — never as silence, and never as a value that looks healthy.** A missing line and a
+healthy line must not be the same shape on a screen, because the whole point of this command is
+that a person reads it.
+
+A **gap** is a fact the command failed to read: a directory the filesystem will not open, a page
+this build does not have, an ABI nothing here knows. A device in a bad state says so in the section
+it belongs to — `would refuse` for a full disk, `not installed` for a missing agent — and those are
+answers, not gaps. When nothing failed to be read, the section says so:
+
+```
+gaps
+  none: every fact above was read from this device
+```
+
+**Nothing in it executes the native helper.** Every line above is a fact about a filesystem and a
+platform, and none of them is an `execve`. The next failure after a report that reads healthy is
+the kernel refusing to exec a file out of the exec directory, a proot build that will not accept
+the flags `ProotCommand` builds, or a Debian that unpacked without a loader in it — and no build of
+this app has ever run proot on any device, which is why the last line of the output says so rather
+than letting a green report imply the device was ready.
+
+**The same holds for the two guest sections, and it is worth being exact about why.** `agent
+update` and `guest origin` do not open a socket and do not start anything; they read a file this
+app wrote at the last boot. What is new is that the file has a writer now, so the report can be
+green about a path that has never executed. **One line of the whole guest start path can only ever
+run on a phone** — `ProotForegroundServer.launch`'s builder start, which the source marks as such.
+**Everything above it** is plain JVM and is covered by tests: the argument vectors, the
+environment, the port check, the probe, the record, and every sentence of every report. **proot
+itself has never been executed in this environment at all** — no device, no emulator, no ARM
+Android — so every statement this document makes about the guest's web half is a statement about
+code that has been read and tested, not about a guest that has answered.
+
 ## Known gaps
 
-- **No processes.** Nothing is forked, ever. `systemctl start` is bookkeeping and a journal line.
+- **No processes here.** Nothing in *this namespace* is forked, ever; `systemctl start` is
+  bookkeeping and a journal line. The guest on the other side of `omp provision` is a different
+  thing and does have processes — see **The guest** in README.md.
 - **No networking of its own.** The namespace shares the phone's: the same `curl`, the same route,
   the same DNS. There is no socket namespace, no port and nothing listening.
 - **No swap and no block devices.** `SwapTotal` is 0 because an app cannot see the kernel's
@@ -291,6 +540,12 @@ core/src/main/kotlin/omp/vm/
   rootfs/Rootfs.kt     the tree, and only-what-is-missing
   workspace/          the conversation folders: the model, the names, the listing
   launcher/           the `omp` command, and where the container and its bind come from
+  provision/           the first-run layer: the real Debian and the real agent, per ABI; the
+                       guest's port, its bind check, its probe, its six states and its record
+  doctor/              `omp doctor`: the ten sections, and the closing line about what it
+                       cannot tell you
+  guestapi/            what the guest's own API does, the measured flags it runs `omp` with, and
+                       the bounded `omp update` the boot makes in there
   proc/ sys/ dev/      the three generated filesystems
   pkg/                 the dpkg database, the local index, install and remove
   service/             systemd-lite and the journal
@@ -304,6 +559,46 @@ core/src/main/kotlin/omp/agent/
   Endpoint.kt          the base URL, checked before a key goes anywhere near it
   store/ http/ json/   the key store, the transcript, the state file; SSE, refusals, JSON
 ```
+
+```
+app/src/main/java/com/omp/terminal/vm/
+  ProotHelper.kt       where the native helper is, the names it has to be found under, and the
+                       two variables the linker and proot read out of their own environment
+  NativeProot.kt       the ProotLauncher that hands ProotProcessLauncher a vector, an environment
+                       and a directory with those two things said
+  ProotProcessLauncher.kt   the half that forks; no android.* in any of the three
+  ProotForegroundServer.kt  the half that starts Apache and walks away. Its builder start is the
+                       one line of the whole guest path that can only ever run on a phone
+  GuestRuntime.kt     the boot composition: wires the seams together once, on its own thread,
+                       and publishes the one report two callers read
+
+app/src/main/jniLibs/<abi>/
+  libproot.so          proot, the one file the kernel execs
+  libproot-loader.so   the loader proot execs in the guest program's place
+  libproot-loader32.so the 32-bit loader; 64-bit ABIs only
+  libtalloc.so         libtalloc 2.4.3, renamed so the package manager will extract it
+  libandroid-shmem.so  libandroid-shmem 0.7
+```
+
+```
+app/src/main/java/com/omp/terminal/web/
+  LocalServer.kt       the ServerSocket, the parser, eleven routes, four threads
+  ChatApi.kt           the routes, the streamed answers, and the pages
+  TokenGate.kt         the one credential check, and an honest account of what it is not
+  UiOrigin.kt          the two origins, the rule that picks one, and the URL predicate
+  UiOrigins.kt         where the port and the token are read from, and the rule that builds a guest
+                       origin only after a page came back from 8732
+
+app/src/main/assets/web/
+  index.html app.css app.js   the chat. Three files, no build step, and the same three bytes
+                               are written into the guest's document root by `omp provision`.
+```
+
+Every name there is `lib*.so` because AOSP's extractor keeps a `lib/<abi>/` entry only if it starts
+with `lib` and ends with `.so`, in a non-debuggable build, with no exception — which is why
+`libtalloc.so.2`, the name in proot's `DT_NEEDED`, cannot be the name it ships under and is copied
+to `filesDir/omp/proot-libs/` at first run instead. The licence, the versions, the repository index
+checksums and the source offer are in README.md; nothing under `jniLibs` is a project-owned work.
 
 The agent is in `:core` and not in `omp/vm/`, because most of it never touches the namespace: it
 is an HTTP client with a prompt. What it does go through the seam for is the two files in the
