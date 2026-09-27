@@ -284,7 +284,7 @@ are real and neither is a fallback in the sense of being embarrassing — the Ko
 build is the only agent a 32-bit device can ever have. **Naming the port is necessary and not
 sufficient**: a Debian that was downloaded is not a guest that is answering, and a build that
 stopped at the port would hand a `WebView` an address that never loads wherever the guest did not
-come up. Read it together with the `guest origin` section above it, which says which of the six
+come up. Read it together with the `guest origin` section above it, which says which of the nine
 states the last start reached and why the app settled on the origin it did.
 
 **The unprovisioned case is the one this build can show on its own.** A device with no Debian, or
@@ -349,6 +349,7 @@ agent update
 
 guest origin
   state:         UP: Apache inside the Debian is answering on http://127.0.0.1:8732 and the boot's 'omp update' landed, so the page the WebView was handed is the Debian's
+  packages:      installed: .omp-guest-packages is in /data/user/0/com.omp.terminal/files/omp/rootfs, and dpkg reports 403.2 MiB (422,789,120 bytes) against the 376.6 MiB (394,945,536 bytes) the manifest estimated on arm64
   port:          8732, reserved by the run that started the guest: it was free, and it was given back so Apache could take it
   apache:        answering: the start asked http://127.0.0.1:8732 for this build's own chat document and got it back
   agent:         ALREADY_CURRENT: the boot's 'omp update' landed at the same start, so the agent the Debian's page is talking to is the one it was brought up to; the 'agent update' section above has what it printed
@@ -380,7 +381,8 @@ next
 | `space check:` | whether `omp provision` would refuse before its first byte, answered with the manifest's own two numbers. |
 | `web bytes:` | whether the guest is serving *this build's* chat UI, and which of the three files is not. |
 | `origin:` and `listening:` | which server the WebView was handed, by name, and whether the app's own port is accepting right now. |
-| `state:` under `guest origin` | which of the six the last start of the guest reached. **`AGENT_UPDATE_FAILED` is a serving state and not a fault**: the page is the Debian's and the agent inside it is the one that was already there. |
+| `state:` under `guest origin` | which of the nine the last start of the guest reached. **`AGENT_UPDATE_FAILED` is a serving state and not a fault**: the page is the Debian's and the agent inside it is the one that was already there. |
+| `packages:` under `guest origin` | what `dpkg` reports on the disk beside what the manifest estimated, and **not** the download, which has no real figure. |
 | `outcome:` under `agent update` | what the last boot's `omp update` did, by name — and `TIMED_OUT` there is the shell's own killed-command number, so it can never be read as the command having failed. |
 | `last attempt:` and `last run:` | the resume record from the disk, and the outcome the running app holds in memory. |
 | the closing line | what this command **cannot** tell you. Read it before concluding anything from a green report. |
@@ -389,6 +391,13 @@ next
 document came back from the reserved port and that the boot's `omp update` landed. It does not say
 which of them did the work, and it cannot: every fact in the two new sections is read off a file
 this app wrote, and none of them is an `execve`.
+
+**The sample above shows the shape of a report, not a measurement of anything.** Every line in it
+is the literal text the command prints for the inputs it is given, but the device it describes has
+never existed. The `packages:` figure in particular is a value chosen to exercise the formatting:
+no `dpkg` has ever run inside a Debian here, so the direction in which the LAMP estimate is wrong
+is not established by this build, and a reader who takes that line as a measurement is reading a
+fixture as a fact.
 
 ### Five situations you will actually hit
 

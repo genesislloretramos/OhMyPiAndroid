@@ -53,18 +53,20 @@ export ANDROID_HOME="$HOME/Android/Sdk"
 echo "sdk.dir=$ANDROID_HOME" > local.properties
 
 ./gradlew :app:assembleDebug     # app/build/outputs/apk/debug/app-debug.apk
-./gradlew :core:test             # 803 tests: the shell, the VM, the agent and the guest, on the JVM
-./gradlew :app:testDebugUnitTest # 101 tests: the web server, the WebView policy, the helper
+./gradlew :core:test             # 814 tests: the shell, the VM, the agent and the guest, on the JVM
+./gradlew :app:testDebugUnitTest # 103 tests: the web server, the WebView policy, the helper
 ```
 
-Both suites are green as written, and neither needs a device. `:core:test` is 803 tests in 39.3
-seconds of execution and 49 seconds for the whole `--rerun-tasks` run with the Kotlin recompile.
-`:app:testDebugUnitTest` is 101 tests in 0.7 seconds of execution and about two seconds of
+Both suites are green as written, and neither needs a device. `:core:test` is 814 tests in 39.4
+seconds of execution and 50 seconds for the whole `--rerun-tasks` run with the Kotlin recompile.
+`:app:testDebugUnitTest` is 103 tests in 0.7 seconds of execution and about two seconds of
 Gradle — it is small because the only thing in `:app` with behaviour worth testing is the
-loopback server, the policy around it and the names of the native helper. The debug APK is
-2,294,381 bytes, and two builds of the same tree are byte-identical. `--rerun-tasks` cannot be
-used on `:app`: it forces
-`:app:compileDebugNavigationResources`, which is not in the offline build cache.
+loopback server, the policy around it and the names of the native helper. The debug APK of this
+tree is 2,299,909 bytes, and two builds of the same tree are byte-identical. The release notes
+quote a different figure for the tagged release, which is what that artifact measured; the two are
+not the same tree and the README carries the one you would get by building what you are reading.
+`--rerun-tasks` cannot be used on `:app`: it forces `:app:compileDebugNavigationResources`, which is
+not in the offline build cache.
 
 ## Use it
 
@@ -167,12 +169,12 @@ $ omp provision
 omp: arm64-v8a: 334.2 MiB (350,458,048 bytes) over the network — 55.7 MiB (58,379,360 bytes) of
 Debian trixie rootfs and 224.0 MiB (234,866,984 bytes) of the omp v18.3.4 agent binary, and
 54.6 MiB (57,211,704 bytes) of LAMP that apt fetches inside the Debian after the rootfs is
-unpacked. It needs 710.9 MiB (745,403,584 bytes) of room on the device, of which 376.7 MiB
+unpacked. It needs 710.9 MiB (745,403,584 bytes) of room on the device, of which 376.6 MiB
 (394,945,536 bytes) is LAMP installed.
 omp: the Debian is provisioned with LAMP from the Debian archive at first boot, not bundled in
 this app: apache2-bin, libapache2-mod-php8.4, php8.4-cli, mariadb-server and their dependencies,
 installed by apt inside the guest once the rootfs is unpacked, for 54.6 MiB (57,211,704 bytes)
-over the same mobile connection and 376.7 MiB (394,945,536 bytes) on the device, both measured,
+over the same mobile connection and 376.6 MiB (394,945,536 bytes) on the device, both measured,
 and not started without you asking. […]
 omp: into /data/user/0/com.omp.terminal/files/omp, with a download in progress kept in
 /data/user/0/com.omp.terminal/files/provision so a cancelled run continues instead of starting again
@@ -190,28 +192,96 @@ the `.part` file's own length is the offset the next run asks for.
 **What it is on your device, and what it is not.** arm64 gets a Debian and the real agent; amd64
 gets a Debian and the real agent; armhf gets a Debian and **no agent**, because upstream ships no
 32-bit Linux build of `omp`; x86 gets **nothing**, because Debian publishes no netboot image for
-i386. Those last two are refused before a question is asked, in a sentence that says which.
+i386. Those last two are refused before a question is asked, in a sentence naming which.
 
-The two LAMP figures are measured **for arm64 only**; the other three ABIs print that nothing has
-been measured for them and that the real first-run cost is therefore larger than the number above
-it, rather than a number borrowed from arm64. The room check is a floor for the same reason: what
-crosses the connection plus what the packages are measured to occupy once installed, and the
-Debian's own unpacked size is not estimated.
+**The `packages:` line in `omp doctor` puts the two figures side by side, and which way the error
+goes is one of the two things only a device can say.** On a real phone it reads `dpkg`'s own
+`Installed-Size`, summed over the names this build asked for, out of `/var/lib/dpkg/status`
+**inside the guest's own rootfs** — no guest process, no network, and it works on every ABI — and
+puts it next to what the manifest estimated. **Which side of the estimate the truth falls on is not
+established by this build.** No `dpkg` has ever run inside a Debian here, so there is no real
+figure in this repository to compare anything against; the only number of that kind here is one a
+test wrote into a status file to exercise the formatting, and a figure invented to exercise a
+formatting is not a measurement of anything. The other half of the same question is the download's
+own byte count against what the manifest predicted, and that one is settled for good: **there is
+no real figure at all**, because `apt` deletes the `.deb` files it fetched, so 57,211,704 bytes
+stays an estimate and the report says so rather than borrowing a number it cannot have.
+
+**The estimate's own provenance is narrower than the number looks.** 376.6 MiB, and the 54.6 MiB
+of download with it, were measured **off-device, against the Debian trixie arm64 package index, on
+one machine**. They are the best figures this build has and they are not a promise about any
+particular phone: `apt` resolving a different closure on a device is a real possibility that no
+argument vector can rule out.
+
+**The other three ABIs have no LAMP figures at all**, and the code says so rather than borrowing
+arm64's: a 32-bit ARM phone gets a Debian and **no agent**, because upstream ships no 32-bit Linux
+build of `omp`; an x86 phone gets **nothing**, because Debian publishes no netboot image for i386.
+Both are refused before a question is asked, in a sentence naming which. The room check is a floor
+for the same reason: what crosses the connection plus what the packages are estimated to occupy
+once installed, and the Debian's own unpacked size is not estimated.
 
 **`omp provision` downloads, verifies and unpacks. Starting the guest is a separate step, and it
 happens at every start of the app rather than at provisioning.** On a provisioned device the app
-reserves a port, links the guest's Apache configuration in, starts Apache in the foreground,
-asks whether a page actually comes back, runs the boot's `omp update`, and writes down which of six
-states that was. It is idempotent — a rotation asks again and gets the same answer, because the
-first run's Apache is holding the port and a second would be a collision with itself.
+reserves the port, installs the guest's LAMP, links the guest's API configuration into Apache,
+starts Apache in the foreground, asks whether a page actually comes back, runs the boot's
+`omp update`, and writes down which of **nine** named states that was. It is idempotent — a
+rotation asks again and gets the same answer, because the first run's Apache is holding the port
+and a second would be a collision with itself.
 
-**The guest's own `apt` install of Apache, PHP and MariaDB is the one step in that sequence this
-build does not take.** The sequence links a configuration drop-in into an Apache and starts it; the
-`apt` step that would put Apache on the disk in the first place is written, priced, measured and
-tested against a fake launcher, and nothing in the app calls it. **A device provisioned today
-therefore has a Debian without Apache on it, and the guest start will reach `APACHE_NOT_ANSWERING`
-and say so.** The state is the honest answer rather than a page from somewhere else, and that is
-what the six states are for.
+**The guest installs its own LAMP at that point, with `apt`, inside the Debian.** It is a
+precondition of the start rather than a step among several, because `apache2ctl` is a program in
+that Debian: there is nothing to start until `apache2`, `php8.4-cli`,
+`libapache2-mod-php8.4` and `mariadb-server` are on the disk. The sequence is
+`apt-get update`, `apt-get install -y` on those four names, and `a2enmod php8.4` — the last one
+because a PHP module unpacked and not enabled is not PHP, and an install that stopped one line
+earlier would be reported as a success with a module no request ever reaches. `update` is not
+policeness: a netboot rootfs ships an empty `/var/lib/apt/lists`, so without it the install
+answers `Unable to locate package apache2-bin` and costs the user the download to find out. There
+is deliberately no `--no-install-recommends`, because the figure the user agreed to was measured
+the way `apt` installs by default.
+
+**It comes after the port check, and that is not an ordering accident.** Spending 55 MB on a guest
+that cannot serve anything this run anyway is spending it for nothing, so the sequence is: reserve
+the port, and only then install.
+
+**It does not run on every start of the app.** A marker inside the tree — `.omp-guest-packages` — is
+written only after the last step exits zero, and a start that finds it launches no command at all.
+That is the property that keeps a 55 MB transfer from being a cost on every open of the phone, and
+a test starts the whole sequence twice and asserts the second run's list of launched commands is
+byte-identical to the first's, which is the only form of "it did not do it again" that means
+anything.
+
+**The bound is five minutes, and it is a ceiling rather than an estimate.** About 57 MB over a phone
+radio is minutes and the unpack onto the same flash is not, so a number in between would be a guess
+dressed as a promise; five minutes is long enough that an install which is going to finish usually
+finishes, and bounded because a wedged `apt` must not hold a start of the app for ever. A run that
+does not fit is **stopped**, recorded `STOPPED` with the shell's own killed-command number 124, and
+the next start runs the sequence again — `apt` is what knows which half is already unpacked, and
+this build does not keep a third resume pattern of its own. The mark is written **last** and only
+on a clean run, so an interrupted install leaves no mark and is continued rather than believed.
+
+**The state is written before the first step runs, not after.** A record that only appears on the
+way out cannot say that a run is in progress, and the run this build cannot see is the one that
+matters: an app killed here, or a phone still doing this while a user is reading `omp doctor` from
+a second process. That run reports as `LAMP_INSTALLING` and says apt is running inside the Debian
+now.
+
+**Three states say the chat is this app's own server, in the same words `PORT_TAKEN` uses**,
+because the lie they prevent is the same one: a page from a different program presented as though
+the Debian's were answering. `LAMP_MISSING` — a Debian and the real agent on the device and no
+`apache2` in it. `LAMP_INSTALLING` — an install was running when the app stopped, so this start
+ran it again. `LAMP_FAILED` — a step exited non-zero or was stopped. **All three have
+`serving == false`, so the origin is never handed to a `WebView` in any of them**, and the report
+names the app's own server rather than replacing the Debian's with it.
+
+**A half-installed stack is `LAMP_FAILED` and never presents as a guest that can serve anything.**
+The ordinary outcome of a phone radio dropping a 55 MB transfer is exactly that, so this is the
+expected case and not the exceptional one — which is why the state exists rather than a
+best-effort start.
+
+**`LAMP_MISSING` is derived off the disk**, the same way the port check and the mark are, so a
+device provisioned today reports the truth without this build having run anything. That is what
+makes the section trustworthy rather than optimistic.
 
 **The port is 8732, one above this app's own 8731.** proot gives the guest no network namespace, so
 a listener inside the Debian holds a socket in the *phone's* loopback and is reachable by every app
@@ -246,14 +316,15 @@ milliseconds and nothing here can close it, and the consequence of losing it is 
 probe fails, the state is `APACHE_NOT_ANSWERING`, and the app's own server is shown *and named as
 the app's own server*.
 
-**The six states, which are the report as much as the behaviour.** `NO_DEBIAN` and `NOT_STARTED`
-are not serving. `PORT_TAKEN` and `APACHE_NOT_ANSWERING` are not serving, and both refuse the
-guest's origin rather than replacing it. `AGENT_UPDATE_FAILED` and `UP` **are** serving, and the
-whole difference between them is the agent inside. `AGENT_UPDATE_FAILED` is the one a reader needs
-the wording of: **the page is the Debian's and the agent inside it is the one that was already
-there, and that is not a failure of the page.** A guest whose agent is out of date is still a guest
-serving a page, and showing this app's Kotlin server instead would trade a real page from a Debian
-for a page from the app on the strength of a version number.
+**The nine states, which are the report as much as the behaviour.** `NO_DEBIAN`, `NOT_STARTED`,
+`LAMP_MISSING`, `LAMP_INSTALLING`, `LAMP_FAILED`, `PORT_TAKEN` and `APACHE_NOT_ANSWERING` are all
+not serving, and each of the last five **refuses the guest's origin rather than replacing it** with
+this app's own server. `AGENT_UPDATE_FAILED` and `UP` **are** serving, and the whole difference
+between them is the agent inside. `AGENT_UPDATE_FAILED` is the one a reader needs the wording of:
+**the page is the Debian's and the agent inside it is the one that was already there, and that is
+not a failure of the page.** A guest whose agent is out of date is still a guest serving a page, and
+showing this app's Kotlin server instead would trade a real page from a Debian for a page from the
+app on the strength of a version number.
 
 **Apache is started before the boot's `omp update` runs, and the update gates nothing on the web
 half.** A phone on a radio where the check takes the full minute would otherwise show nothing for a
@@ -263,10 +334,18 @@ here: Apache, its PHP, its filesystem and the `web` command come up whether or n
 
 **Nothing in this repository has ever run the guest, the native helper or the real agent on a
 phone, an emulator or a test, and proot itself has never been executed in this environment at
-all** — no device, no emulator, no ARM Android. The one line of the whole guest start path that can
-only ever run on a phone is `ProotForegroundServer.launch`'s builder start, and the source marks it
-as such. **Everything above it** — the argument vectors, the environment, the port check, the
-probe, the record and every sentence of every report — is plain JVM and is covered by tests. A
+all** — no device, no emulator, no ARM Android. **The `apt` sequence has never been run against a
+real Debian on any ABI, and no `dpkg` has ever run inside one**, so the figure `omp doctor`
+reports as dpkg's is a number this build carries rather than one it has taken; the tests that
+exercise it are a fake launcher and a temporary directory, and a fake `apt` is not an `apt`.
+Whether `deb.debian.org` is reachable from inside a proot guest, whether `mariadb-server`'s
+`postinst` completes with no init to start a server with, and whether these four packages install
+at all on trixie are all open, and nothing in this app answers them in advance.
+
+The one line of the whole guest start path that can only ever run on a phone is
+`ProotForegroundServer.launch`'s builder start, and the source marks it as such. **Everything above
+it** — the argument vectors, the environment, the port check, the install sequence and its bound,
+the probe, the record and every sentence of every report — is plain JVM and is covered by tests. A
 helper present in an APK is not a helper that has run, and `omp doctor` says so in its own closing
 line. Everything this document says about the guest's web half is a statement about code that has
 been read and tested, not about a guest that has answered.
