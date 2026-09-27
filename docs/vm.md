@@ -200,7 +200,12 @@ that is not there and an `ls` that says `No such file or directory`. Run `grant-
 phone and reboot the VM.
 
 `/mnt/omp` is the same idea one directory in: `/storage/emulated/0/Documents/omp`, so a
-conversation in the namespace and a folder in the user's `Documents` are one folder. It differs in
+conversation in the namespace and a folder in the user's `Documents` are one folder. That is also
+why the agent runs there: a conversation is a folder, and a model needs a folder. Bare `omp` is the
+launcher outside one and the coding agent inside one, decided by the same `OMP_WORKSPACE` the
+launcher sets — and the agent's own words (`run`, `update`, `key`, `help`) are checked before a
+bare name is taken for a conversation, so `omp update` out here is a question about the agent and
+not an attempt to open a folder called `update`. It differs in
 where it comes from. A user's bind is typed, is recorded in `/etc/fstab`, comes back at every boot
 and can be taken away with `vm umount`; this one is **the app's own** — made at the end of every
 boot from the app's own facts, in no fstab line, and refused by `vm umount` by name. A second
@@ -290,7 +295,22 @@ core/src/main/kotlin/omp/vm/
   pkg/                 the dpkg database, the local index, install and remove
   service/             systemd-lite and the journal
   cmd/                 the commands that have to speak the Vfs
+
+core/src/main/kotlin/omp/agent/
+  Agent.kt             the version, the verb list, the key store, the help, who may ask
+  Session.kt           the loop: a prompt, a question, a stream, the transcript
+  KeyCommand.kt        `omp key`, the one command that handles a credential
+  UpdateCommand.kt     `omp update`: the identity block, and the one thing it cannot do
+  Endpoint.kt          the base URL, checked before a key goes anywhere near it
+  store/ http/ json/   the key store, the transcript, the state file; SSE, refusals, JSON
 ```
+
+The agent is in `:core` and not in `omp/vm/`, because most of it never touches the namespace: it
+is an HTTP client with a prompt. What it does go through the seam for is the two files in the
+conversation's own `.omp/` — the transcript and the state file — which is the same promise the
+rest of this document makes. **The key is the one thing it does not go through the seam for**: it
+is read by the app out of its own private storage and handed to the transport, so no path inside
+the namespace leads to it.
 
 `core/src/test/kotlin/omp/vm/VmEndToEndTest.kt` drives the whole thing the way a user does —
 keystrokes into one `InputChannel`, answers off one `Screen`, and every fact checked against the

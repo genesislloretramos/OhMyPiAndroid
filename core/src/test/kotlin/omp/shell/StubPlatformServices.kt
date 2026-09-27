@@ -37,6 +37,13 @@ class StubPlatformServices(
     var clipboard: String? = null
     var windowTitle: String = ""
     var http: PlatformServices.HttpResult? = null
+
+    /**
+     * The streaming seam, as a field a test sets. There is no sensible default for it: a stream is
+     * a socket and a script of events, and a stub that invented one would answer a question nobody
+     * asked. A test that wants one points this at a real server.
+     */
+    var stream: ((String, String, List<Pair<String, String>>, ByteArray?) -> HttpStream)? = null
     val prefs = HashMap<String, String>()
     var pssKb = 12345L
     var cpuTimes = 0L to 0L
@@ -113,6 +120,10 @@ class StubPlatformServices(
     override fun captureScreenPng(): ByteArray? = captured
     override fun httpGet(url: String, method: String, headers: List<Pair<String, String>>): PlatformServices.HttpResult =
         http ?: PlatformServices.HttpResult(0, ByteArray(0), emptyList())
+
+    override fun httpStream(url: String, method: String, headers: List<Pair<String, String>>, body: ByteArray?): HttpStream =
+        stream?.invoke(url, method, headers, body)
+            ?: throw UnsupportedOperationException("no stream configured")
 
     override fun prefInt(key: String, fallback: Int): Int = prefs[key]?.toIntOrNull() ?: fallback
     override fun prefBoolean(key: String, fallback: Boolean): Boolean = prefs[key]?.toBoolean() ?: fallback

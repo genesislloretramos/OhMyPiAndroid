@@ -48,7 +48,7 @@ export ANDROID_HOME="$HOME/Android/Sdk"
 echo "sdk.dir=$ANDROID_HOME" > local.properties
 
 ./gradlew :app:assembleDebug     # app/build/outputs/apk/debug/app-debug.apk
-./gradlew :core:test             # 276 tests: the shell's whole behaviour, on the JVM, in a few seconds
+./gradlew :core:test             # 529 tests: the shell's whole behaviour, on the JVM, in a few seconds
 ```
 
 ## Use it
@@ -154,9 +154,110 @@ omp: in photos
   OMP_WORKSPACE_REAL=/storage/emulated/0/Documents/omp/photos
 ```
 
+### The agent
+
+Inside a conversation, `omp` is not the launcher any more — it is the coding agent. The words that
+mean something there are `omp` itself, `run`, `update`, `key` and `help`, plus `--yes` on `omp`.
+
+```
+$ omp new fotos
+omp: created and in fotos
+  OMP_WORKSPACE=/storage/emulated/0/Documents/omp/fotos
+  OMP_WORKSPACE_REAL=/storage/emulated/0/Documents/omp/fotos
+
+$ omp update && omp
+omp agent 0.1.0
+  folder:     /storage/emulated/0/Documents/omp/fotos
+  provider:   openai
+  endpoint:   https://api.openai.com/v1/chat/completions
+  model:      gpt-4o-mini
+  key:        /data/user/0/com.omp.terminal/files/agent/openai.key (43 bytes, never printed)
+  transcript: …/fotos/.omp/transcript.jsonl — 0 entries, 0 of 8388608 bytes
+  tools:      read_file, list_dir, search, write_file, edit_file — inside this conversation only
+  writes:     every write_file and edit_file is put to the user first;
+              'omp --yes' approves them all, and the transcript records it
+  There is no run tool: the shell in this VM can 'vm reset' and throw away the namespace
+  this conversation is in, and the model picks its own command lines. Use the file
+  tools above; the user can run a command themselves.
+  state:      written by this build
+  this command does not download anything and cannot: the agent is Kotlin inside the app you are
+  already running, so a newer agent is a newer build of this app
+omp agent 0.1.0, in this conversation's folder:
+  /storage/emulated/0/Documents/omp/fotos
+omp[fotos] > what is in here?
+```
+
+**The folder is the conversation.** Every question and every answer is appended to
+`.omp/transcript.jsonl` inside it, so the next `omp` in the same folder continues the exchange —
+including one the user interrupted half way through, which is recorded as what had arrived.
+`Ctrl-C` stops an answer, closes the stream and writes it down; `Ctrl-C` on an empty prompt leaves.
+
+**A Ctrl-C on a stalled answer is a quarter of a second plus a second, and that is arithmetic
+rather than a hope.** Nothing can interrupt a read already parked inside a socket, so the transport
+sets a 250 ms read timeout as a *checkpoint* rather than a limit and looks at the clock and a cancel
+flag every time it fires; the watchdog asks the shell's flag once a second and calls `close()`. So
+the flag is issued within a second of the keystroke and acted on within a quarter of a second of
+that. Five minutes of silence is the actual limit, and passing it ends the answer with the host
+named and roughly how long it was quiet.
+
+**The key is typed, never echoed and never shown.** `omp key` asks for it with the terminal's echo
+off and puts it through `KeyStore`, in the app's private `files/agent/<provider>.key` — deliberately
+outside the VM namespace and outside `Documents/omp`, so no path the agent can reach leads to it.
+`omp key --show` names the provider, the file and a byte count; there is no code path from it to
+the secret.
+
+```
+$ omp key                     # prompted, echo off
+$ omp key --show              # provider, file, byte count
+$ omp key --list              # every provider that has a key
+$ omp key --forget openai     # exactly one
+```
+
+**The agent has five file tools, and they reach one folder.** `read_file`, `write_file`,
+`edit_file`, `list_dir` and `search`, declared to the model with the description and the parameters
+that are the model's only documentation of them. Everything they do goes through one class,
+`omp.agent.tools.Sandbox`, and every path it is asked about is checked there and nowhere else: one
+decision, one place, and no way to reach the filesystem from the agent without an answer from it.
+
+**The boundary is this conversation's folder, and it is the strict answer.** The user permitted
+`Documents/omp`; the agent was then given *one* conversation inside it, and the container above is
+refused — **even for a read**, because listing somebody else's conversations is a capability it
+was not given. Names are compared exactly: nothing folds case and nothing normalises Unicode, so
+`Photos` and `photos` are not the same directory to a model that was not given either spelling.
+A symlink is followed and its *target* is what is checked, the way the kernel does it. **A file on
+the phone is not a sandbox boundary, and the app does not claim one**: this stops the accident — a
+model that is confidently wrong about where it may write, a `..` that walked out of the folder —
+and it is not a wall against a determined caller, which in this app would be Kotlin inside the app
+the user already installed.
+
+**Every write is put to the user, one keypress at a time.** Before any `write_file` or `edit_file`
+the agent prints the path, the same path as a file manager shows it, the size, and for an edit the
+old and the new text. `y` goes ahead; anything else cancels that call and the model is told the user
+declined. A Ctrl-C cancels the call and gives the terminal back. **`omp --yes` approves every call
+in that turn without asking, and the transcript records `auto` rather than `y`** — so a folder read
+afterwards can tell a write nobody looked at from one a person did.
+
+**There is no `run` tool, and that is a decision.** A shell inside this VM is a shell that can
+`vm reset` and destroy the namespace the conversation is in, and the model picks its own command
+lines — and a line of shell is not something an approval prompt on a phone can honestly summarise.
+So the file tools are here and the shell is not; a user who wants a command run can run it in the
+terminal they are already sitting at. A model that asks for one anyway gets a tool result naming
+the five and saying why, and the loop carries on. So does a model that names a tool this build does
+not have, that sends arguments which are not a JSON object, or that asks for a path outside the
+folder: every refusal is a result the model can read and recover from, never an exception that ends
+a conversation. One question gets at most ten tool rounds, and hitting that is said out loud and
+written to the transcript rather than being silent.
+
+`omp update` deliberately prints no progress bar, no version check and nothing that implies a
+download, because nothing in this app can download anything. It reports the version, the provider,
+the endpoint, the model, the key's file, and the transcript's size against its cap.
+
 `omp ls` lists and changes nothing. `omp rm NAME` refuses without `--force`, printing the real path
 and what is under it first, and says so again for a folder this app did not make. Ctrl-C at the
 prompt cancels it: no half-created folder, no session moved.
+
+Outside a conversation, `omp update` says in three lines that there is nothing to report yet and how
+to make something to report, and opens no folder.
 
 The whole thing needs the all-files grant, because `Documents` does. Without `grant-storage` it
 says exactly that and creates nothing — not a folder that looks like it worked. And on a pipe, in

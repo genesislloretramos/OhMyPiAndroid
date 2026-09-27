@@ -163,6 +163,9 @@ class LauncherTest {
     @Test
     fun thePromptAnswersNWithAFreshFolderAndEntersIt() {
         phone.run("omp new notes")
+        // Step out of it: bare `omp` inside a conversation is the agent, and this is the
+        // launcher's prompt, so the session has to be standing somewhere else.
+        phone.run("cd \$HOME")
         phone.feed("n")
         val asked = phone.runInteractive("omp")
         assertEquals(asked.err, 0, asked.status)
@@ -190,6 +193,7 @@ class LauncherTest {
     @Test
     fun aPipedOmpPrintsTheTableAndTheTwoOptionsAndReturns() {
         phone.run("omp new photos")
+        phone.run("cd \$HOME")
         val before = phone.shell.session.cwd
         val piped = phone.runPiped("omp")
         assertEquals(piped.err, 0, piped.status)
@@ -217,6 +221,7 @@ class LauncherTest {
     @Test
     fun aBackgroundOmpDoesNotTakeTheTerminalAndDoesNotBlock() {
         phone.run("omp new photos")
+        phone.run("cd \$HOME")
         val before = phone.shell.session.cwd
         // The channel and `isTty` are the terminal's here, so this is the one case where asking
         // would look right and be wrong: the REPL is back at its prompt before the job has printed
@@ -475,6 +480,9 @@ class LauncherTest {
     @Test
     fun aRedirectedOmpPrintsTheTableToTheFileAndAsksNothing() {
         phone.run("omp new photos")
+        // Out of it again: bare `omp` inside a conversation is the agent, whose non-tty line is a
+        // different one, and this is about the launcher's table going to a file.
+        phone.run("cd \$HOME")
         val before = phone.shell.session.cwd
         val captured = File(folder.root, "captured.txt")
         // The channel and `isTty` are the terminal's here: `omp` is the last stage of a one-stage

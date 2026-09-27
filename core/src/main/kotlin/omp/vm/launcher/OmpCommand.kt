@@ -1,5 +1,9 @@
 package omp.vm.launcher
 
+import omp.agent.Agent
+import omp.agent.KeyCommand
+import omp.agent.Session
+import omp.agent.UpdateCommand
 import omp.shell.exec.Command
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.Errno
@@ -41,20 +45,46 @@ import omp.vm.workspace.WorkspaceList
  * **`omp rm` is the one destructive thing here**, so it follows the rule `vm reset` follows: it
  * refuses without `--force`, after printing the real path and what is under it, and a folder this
  * app did not make says why it is being treated as somebody else's.
+ *
+ * ### And inside a conversation, `omp` is the agent
+ *
+ * The same word means two things, and [ENV_WORKSPACE] is what decides which: outside a
+ * conversation this is the launcher, unchanged; inside one, bare `omp` starts
+ * [omp.agent.Session] and its four verbs are [Agent.VERBS]. **The list is checked before the
+ * "a bare name is a conversation" path**, so `omp update` outside a conversation is a question
+ * about the agent and not an attempt to open a folder called `update` — which is the difference
+ * between a launcher that grew a mode and a namespace where a user's conversation is one typo
+ * away from being hijacked by a subcommand name.
+ *
+ * The launcher's own words are deliberately *not* in that list: `omp new`, `omp ls` and
+ * `omp rm` keep working inside a conversation, because a folder is still a folder and the
+ * launcher is still how a user gets out of one and into another.
  */
 @CommandSpec(
     name = "omp",
-    synopsis = "[NAME | new [NAME] | ls | rm NAME --force]",
+    synopsis = "[--yes] [NAME | new [NAME] | ls | rm NAME --force | run | key [OPTION] | update | help]",
     group = "system",
     notes = "conversations are plain folders in Internal storage ▸ Documents ▸ omp, one folder each; " +
-        "the folder owns its name, needs the grant-storage all-files grant, and is the same folder in the VM at /mnt/omp",
+        "the folder owns its name, needs the grant-storage all-files grant, and is the same folder in the VM at /mnt/omp; " +
+        "inside one, bare omp is the coding agent, with five file tools that reach that folder and nothing else, " +
+        "and 'omp --yes' approves the ones that write without asking",
 )
 class OmpCommand : Command {
 
     override fun run(ctx: ExecContext): Int {
         val args = ctx.args
-        return when (val sub = args.firstOrNull()) {
-            null -> opener(ctx)
+        val first = args.firstOrNull()
+        // Before the bare-name path, and deliberately: these four words belong to the agent, so
+        // `omp key` is a credential and not a conversation called `key`.
+        if (Agent.isVerb(first)) return agent(ctx, first!!, args.drop(1))
+        // `--yes` is a flag on the session rather than a subcommand, and it is read here so that
+        // `omp --yes` and `omp run --yes` are the same invocation. It is refused anywhere a
+        // conversation is opened or made, because approving a tool call in a session that is not
+        // running is approving nothing — and a flag quietly ignored where it does not apply is a
+        // flag a user will believe is in force.
+        if (first == YES) return withYes(ctx, args.drop(1))
+        return when (val sub = first) {
+            null -> if (inConversation(ctx)) converse(ctx, emptyList(), false) else opener(ctx)
             "new" -> create(ctx, args.drop(1))
             "ls" -> list(ctx, args.drop(1))
             "rm" -> remove(ctx, args.drop(1))
@@ -63,6 +93,85 @@ class OmpCommand : Command {
             // answer than "no such subcommand".
             else -> if (args.size == 1) open(ctx, sub) else usage(ctx)
         }
+    }
+
+    /**
+     * `omp --yes` and `omp run --yes`: the agent, with every write approved without asking.
+     *
+     * The approval itself is not made here — nothing is approved until a model asks for a write —
+     * and the transcript records `auto` rather than `y` on every one of them, so a folder read
+     * afterwards can tell a silent write from one somebody looked at.
+     */
+    private fun withYes(ctx: ExecContext, rest: List<String>): Int = when (val first = rest.firstOrNull()) {
+        null -> if (inConversation(ctx)) converse(ctx, emptyList(), true) else outsideConversation(ctx)
+        "run" -> converse(ctx, rest.drop(1), true)
+        else -> {
+            ctx.errLine("$USAGE: $YES approves a tool call inside a session, and nothing else")
+            printUsage(ctx.stderr, "$USAGE $YES [run]")
+            ExecContext.EXIT_USAGE
+        }
+    }
+
+    // ---- the agent, inside a conversation ---------------------------------------------------
+
+    /**
+     * The four verbs, dispatched.
+     *
+     * `else` is `help` and is also the answer for a word added to [Agent.VERBS] without a case
+     * here: the help lists every verb and what it does, so a verb nobody has written yet is at
+     * least described rather than being an error the user cannot interpret.
+     */
+    private fun agent(ctx: ExecContext, verb: String, operands: List<String>): Int = when (verb) {
+        "run" -> converse(ctx, operands, false)
+        "key" -> KeyCommand(ctx, Agent.store(ctx)).run(operands)
+        "update" -> UpdateCommand(ctx, Agent.store(ctx)).run()
+        else -> Agent.help(ctx)
+    }
+
+    /**
+     * Whether the session is standing in a conversation, which is what changes what `omp` means.
+     *
+     * **The working directory has to be inside the folder as well.** The environment is set once,
+     * by [enter], and a `cd ..` does not clear it — so a session that had walked out of the
+     * conversation would still be told it was in one, and bare `omp` would open an agent in a
+     * folder the user had already left. Asking the session where it is standing is the one answer
+     * that cannot go stale, and it is the answer the prompt is drawn from anyway.
+     */
+    private fun inConversation(ctx: ExecContext): Boolean {
+        val dir = ctx.env[ENV_WORKSPACE]?.takeIf { it.isNotBlank() } ?: return false
+        return within(ctx.session.cwd, dir)
+    }
+
+    /**
+     * `omp` inside a conversation, and `omp run`: the agent, on this terminal.
+     *
+     * The conversation is taken from the launcher's own environment rather than looked up again,
+     * because the launcher is what put the session in that folder and is the only thing that
+     * knows both of its names — and it is gated on [inConversation] like a bare `omp` is, so
+     * `omp run` after a `cd ..` gets the same two-line refusal a bare `omp` would. Outside one
+     * there is nothing to run in, and that is said plainly: the agent works in a folder, and a
+     * folder is made with `omp new`.
+     */
+    private fun converse(ctx: ExecContext, operands: List<String>, yes: Boolean): Int {
+        if (operands.isNotEmpty()) {
+            ctx.errLine("$USAGE run: it takes no arguments")
+            printUsage(ctx.stderr, "$USAGE [run]")
+            return ExecContext.EXIT_USAGE
+        }
+        // The same gate as a bare `omp`, and for the same reason: the environment still names a
+        // conversation after a `cd ..` out of it, and an agent whose prompt and system prompt name
+        // a folder the shell has left is worse than the refusal. One rule, one place to read it.
+        if (!inConversation(ctx)) return outsideConversation(ctx)
+        val dir = ctx.env[ENV_WORKSPACE]!!
+        val real = ctx.env[ENV_WORKSPACE_REAL]?.takeIf { it.isNotBlank() } ?: dir
+        return Session(ctx, dir, real, yes).run()
+    }
+
+    /** An agent verb outside a conversation, and what to do about it. Nothing is created. */
+    private fun outsideConversation(ctx: ExecContext): Int {
+        ctx.errLine("$USAGE: the agent runs in a conversation folder, and this session is not in one")
+        ctx.errLine("$USAGE: 'omp new NAME' makes one and puts you in it; 'omp ls' lists the ones there are")
+        return ExecContext.EXIT_USAGE
     }
 
     // ---- the flow the user described -------------------------------------------------------
@@ -146,26 +255,15 @@ class OmpCommand : Command {
     }
 
     /**
-     * Whether this command may take the terminal, which takes three things being true.
+     * Whether this command may take the terminal: [Agent.mayPrompt], and that is where the three
+     * conditions live now.
      *
-     * **It has to be the terminal.** [omp.shell.InputChannel.owns] is the authority: a pipe, a
-     * script and `vm exec` — which runs a line in a throwaway session over a channel nothing will
-     * ever write to — all hand a command a stdin that is not this session's, and `isTty` alone
-     * would say yes to all three.
-     *
-     * **It has to be the foreground.** A `&` job gets the same channel and the same `isTty`, and
-     * the REPL is back at its prompt before the job has printed a line: a question asked there
-     * would take keystrokes the line editor expects, on a thread nobody is waiting for, and the
-     * two of them would fight over one keyboard. [omp.shell.Session.foreground] is the same fact
-     * Ctrl-C uses, and its [omp.shell.exec.JobGroup.background] says which kind of job this is.
-     *
-     * **And stdout has to be a terminal**, or the question would be asked into a pipe and never
-     * seen.
+     * They are not repeated here on purpose. The agent asks questions of the same terminal and
+     * has to reach the same answer about a pipe, a background job and a `vm exec` line — and a
+     * second copy of a rule that decides whether to block on a keypress is a second copy that
+     * will eventually disagree with the first, in the case where a command hangs.
      */
-    private fun mayPrompt(ctx: ExecContext): Boolean {
-        val job = ctx.session.foreground ?: return false
-        return ctx.isTty && !job.background && ctx.session.input?.owns(ctx.stdin) == true
-    }
+    private fun mayPrompt(ctx: ExecContext): Boolean = Agent.mayPrompt(ctx)
 
     /** `omp new [name]`: a folder, made and entered, with nothing asked. */
     private fun create(ctx: ExecContext, operands: List<String>): Int {
@@ -510,8 +608,12 @@ class OmpCommand : Command {
 
         private const val USAGE = "omp"
         private const val FORCE = "--force"
+
+        /** The flag that answers an approval prompt on the user's behalf, for this one turn. */
+        private const val YES = "--yes"
         private const val CTRL_C = 0x03
         private const val USAGE_TEXT =
-            "omp [NAME|omp new [NAME]|omp ls|omp rm NAME $FORCE]"
+            "omp [NAME|omp new [NAME]|omp ls|omp rm NAME $FORCE]\n" +
+            "  inside a conversation: 'omp' is the coding agent — 'omp help' lists its verbs"
     }
 }

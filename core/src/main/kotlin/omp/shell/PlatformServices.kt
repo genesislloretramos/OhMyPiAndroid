@@ -140,6 +140,23 @@ interface PlatformServices {
 
     fun httpGet(url: String, method: String, headers: List<Pair<String, String>>): HttpResult
 
+    /**
+     * Opens a streaming request and answers the first event, so a bad key fails before a prompt is
+     * typed.
+     *
+     * [HttpResult] is the other half of this seam and the wrong shape for a model: it holds a
+     * whole body, and a reply that streams arrives a token at a time over minutes. The status is
+     * on the [HttpStream] because the two are one fact — a 401 is a failed request, and a second
+     * call to ask would be a second chance to race.
+     *
+     * The returned stream reads through **checkpoints**, not against a timeout: a read timeout of
+     * [SseStream.STREAM_POLL_MS] is a place to notice a `close()` from another thread, and
+     * [SseStream.STREAM_SILENCE_LIMIT_MS] is the limit. Both are the implementation's decision and
+     * neither is a parameter here, because a caller that could set them would be a caller that
+     * could set the limit low enough to kill a reasoning model's silence.
+     */
+    fun httpStream(url: String, method: String, headers: List<Pair<String, String>>, body: ByteArray?): HttpStream
+
     // ---- settings store ----------------------------------------------------------------
 
     fun prefInt(key: String, fallback: Int): Int

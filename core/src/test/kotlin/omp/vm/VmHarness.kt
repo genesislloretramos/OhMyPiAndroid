@@ -1,5 +1,6 @@
 package omp.vm
 
+import omp.shell.HttpStream
 import omp.shell.PlatformServices
 import omp.shell.StubPlatformServices
 import omp.shell.fs.FsErrno
@@ -100,6 +101,8 @@ class VmServices(
     override fun captureScreenPng(): ByteArray? = stub.captureScreenPng()
     override fun httpGet(url: String, method: String, headers: List<Pair<String, String>>): PlatformServices.HttpResult =
         stub.httpGet(url, method, headers)
+    override fun httpStream(url: String, method: String, headers: List<Pair<String, String>>, body: ByteArray?): HttpStream =
+        stub.httpStream(url, method, headers, body)
     override fun prefInt(key: String, fallback: Int): Int = stub.prefInt(key, fallback)
     override fun prefBoolean(key: String, fallback: Boolean): Boolean = stub.prefBoolean(key, fallback)
     override fun prefString(key: String, fallback: String): String = stub.prefString(key, fallback)

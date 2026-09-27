@@ -31,6 +31,9 @@ import android.view.Display
 import android.view.PixelCopy
 import android.view.Window
 import android.view.WindowManager
+import omp.agent.http.HttpRefusal
+import omp.shell.HttpRequests
+import omp.shell.HttpStream
 import omp.shell.PlatformServices
 import omp.shell.PlatformServices.IntentSpec
 import omp.shell.PlatformServices.BatteryInfo
@@ -39,11 +42,12 @@ import omp.shell.PlatformServices.MemoryInfo
 import omp.shell.PlatformServices.NetInterface
 import omp.shell.PlatformServices.Route
 import omp.shell.PlatformServices.StorageVolume
+import omp.shell.SseStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
-import java.net.URL
+import java.net.SocketTimeoutException
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.CountDownLatch
@@ -859,22 +863,22 @@ class AndroidPlatformServices(
     /**
      * One request through [HttpURLConnection] with the platform trust manager, so TLS is exactly
      * the TLS this device trusts. The status code comes back for an error response too, which is
-     * what lets `curl` print the body of a 404.
+     * what lets `curl` print the body of a 404 — and which is why this asks [HttpRequests] for a
+     * connection rather than for a status it would have to take back apart.
+     *
+     * A 3xx comes back as a 3xx, with its `Location` among the headers, rather than as a second
+     * request: this one carries whatever headers the caller passed — for the agent, an
+     * `Authorization` — and a redirect is not a reason to present it to the host it named.
      *
      * Connection failures are deliberately not caught: `curl` maps `UnknownHostException`,
      * `ConnectException` and `SocketTimeoutException` onto its own wording, which needs the
      * exception type.
      */
     override fun httpGet(url: String, method: String, headers: List<Pair<String, String>>): HttpResult {
-        val conn = URL(url).openConnection() as HttpURLConnection
+        val conn = HttpRequests.open(url, method, headers, null, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS)
         try {
-            conn.instanceFollowRedirects = true
-            conn.connectTimeout = HTTP_TIMEOUT_MS
-            conn.readTimeout = HTTP_TIMEOUT_MS
-            conn.requestMethod = method
-            for ((key, value) in headers) conn.setRequestProperty(key, value)
             val code = conn.responseCode
-            val stream = if (code in 200..399) conn.inputStream else conn.errorStream
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val body = stream?.use { it.readBytes() } ?: ByteArray(0)
             val collected = ArrayList<Pair<String, String>>()
             for ((key, values) in conn.headerFields) {
@@ -886,6 +890,21 @@ class AndroidPlatformServices(
             conn.disconnect()
         }
     }
+
+    /**
+     * The request, its status and the whole read loop are [omp.shell.SseStream] in `:core`, where a
+     * JVM test can reach the line assembly, the poll and the wall clock — a poll that only existed
+     * in a copy of the transport inside an Android module was a poll nobody could prove worked.
+     * This supplies the connect timeout and nothing else; the read timeout, the checkpoint loop and
+     * the reply's limit are that class's, and it says why in its KDoc.
+     */
+    override fun httpStream(
+        url: String,
+        method: String,
+        headers: List<Pair<String, String>>,
+        body: ByteArray?,
+    ): HttpStream = SseStream.open(url, method, headers, body, HTTP_TIMEOUT_MS)
+
 
     // ---- settings store ----------------------------------------------------------------
 
@@ -911,6 +930,8 @@ class AndroidPlatformServices(
         private const val HTTP_TIMEOUT_MS = 15_000
         private const val CAPTURE_TIMEOUT_MS = 3_000L
 
+
+
         /** `BatteryManager.getIntProperty` reports an unsupported property as `Int.MIN_VALUE`. */
         private const val UNDEFINED_PROPERTY = Int.MIN_VALUE
 
@@ -928,6 +949,7 @@ class AndroidPlatformServices(
         )
     }
 }
+
 
 /** The `am start` line and its failure text describe the intent the same way. */
 internal fun describeIntent(spec: IntentSpec): String {
