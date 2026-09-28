@@ -13,8 +13,8 @@ import omp.vm.provision.Artifact
 import omp.vm.provision.ArtifactManifest
 import omp.vm.provision.GuestOriginRecord
 import omp.vm.provision.GuestState
-import omp.vm.provision.InstallRecord
 import omp.vm.provision.GuestWeb
+import omp.vm.provision.InstallRecord
 import omp.vm.provision.ProvisionPaths
 import omp.vm.provision.ProvisionState
 import omp.vm.provision.ProvisionStatus
@@ -22,6 +22,7 @@ import omp.vm.provision.ProvisionStatusHolder
 import omp.vm.provision.WebRoot
 import omp.vm.provision.readRecord
 import omp.vm.provision.recordFile
+import omp.vm.web.ChatServerStatusHolder
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -943,6 +944,14 @@ class Doctor(
                 }
             },
         )
+        // A refusal is the one answer in this section that cannot be read off the disk, so it is
+        // asked of the process instead: the service that was refused recorded the platform's own
+        // sentence when it stopped itself, and a report that said only "no url" would leave the
+        // reader to choose between "never started" and "refused by Android 14", which are not the
+        // same bug. It is null on every other state, so a healthy report is unchanged.
+        ChatServerStatusHolder.current.line()?.let {
+            out.pair("refused", "the platform would not let this service run: $it")
+        }
         val answered = chat.probed
         if (answered == null) {
             out.pair("port", out.gap(chat.noPort!!))

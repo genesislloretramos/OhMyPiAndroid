@@ -10,11 +10,14 @@ import omp.vm.provision.Abi
 import omp.vm.provision.ArtifactManifest
 import omp.vm.provision.GuestPackages
 import omp.vm.provision.GuestStart
+import omp.vm.provision.GuestState
 import omp.vm.provision.GuestStartReport
 import omp.vm.provision.GuestWeb
 import omp.vm.provision.ProotCommand
 import omp.vm.provision.ProvisionPaths
+import omp.vm.provision.startFailed
 import omp.vm.provision.notStarted
+import omp.vm.provision.startFailed
 import java.io.OutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -109,7 +112,17 @@ object GuestRuntime {
      */
     fun start(services: PlatformServices, out: OutputStream) {
         if (!begun.compareAndSet(false, true)) return
-        Thread({ report = run(services, out) }, "omp-guest-start").apply {
+        Thread({
+            val failed = guard(paths = pathsFor(services), out) { run(services, out) }
+            if (failed.state == GuestState.START_FAILED) {
+                // The record is what `omp doctor` reads; this is the copy in logcat, and it is here
+                // rather than inside the guard so that the guard is one statement over a Vfs and can
+                // be read by a test on a machine with no Android at all.
+                Log.w(TAG, "guest start threw: ${failed.said}")
+                for (line in failed.lines) Log.w(TAG, "  $line")
+            }
+            report = failed
+        }, "omp-guest-start").apply {
             isDaemon = true
             start()
         }
@@ -211,6 +224,57 @@ object GuestRuntime {
      * is two chances to read the wrong property, and the wrong property here is an empty ABI list,
      * which is a device this build decides it cannot start a guest on.
      */
+    /** Where the payload is, for the guard's own report when the composition never got that far. */
+    private fun pathsFor(services: PlatformServices): ProvisionPaths =
+        ProvisionPaths.inAppStorage(services)
+
+    /**
+     * The thread boundary, and the one place a throw from the guest path is contained.
+     *
+     * **Why this has to exist at all.** This app installs no `Thread.setDefaultUncaughtExceptionHandler`
+     * of its own, so an exception on a daemon thread reaches Android's, which ends the process. A
+     * start of the guest does four things that touch the filesystem, a process and a socket, and
+     * none of them is guaranteed total — a user would see the app open and then die a second later,
+     * with nothing on the screen to explain it. The alternative was a handler, and a handler is a
+     * second thing to keep correct; this is the one statement that has to be there.
+     *
+     * **`catch (Throwable)`, and the cost is stated rather than hidden.** `Exception` would be the
+     * usual answer and it is not enough: a guest whose proot or loader is missing produces a
+     * `NoClassDefFoundError`, and a phone whose payload was half written can produce an
+     * `OutOfMemoryError` mid-install, and both of those kill the process exactly as dead as an
+     * `IOException`. Swallowing them leaves the app degraded — a terminal, a Kotlin chat, a `guest
+     * origin` line that says `START_FAILED` — which for an app whose user is typing into a terminal
+     * is the better of the two outcomes. The terminal keeps working because this thread owns nothing
+     * but the guest.
+     *
+     * **What is caught becomes [omp.vm.provision.GuestState.START_FAILED] with the reason in
+     * [omp.vm.provision.GuestStartReport.said], written to the same record every other outcome
+     * writes.** That is what makes it a state and not a silence: `omp doctor`'s `guest origin`
+     * section reads the record in a different process and quotes the reason, so a user whose guest
+     * threw can find out what threw without this app's log. A body that returns normally is passed
+     * straight through, unchanged.
+     */
+    internal fun guard(
+        paths: ProvisionPaths,
+        out: OutputStream,
+        body: () -> GuestStartReport,
+    ): GuestStartReport = try {
+        body()
+    } catch (t: Throwable) {
+        val reason = "${t.javaClass.simpleName}: ${t.message ?: "no message"}"
+        // The stream is a convenience and not the report. A log that will not take a line must not
+        // be able to turn a contained failure back into an uncontained one, which is why every write
+        // in here is inside the same catch and nothing after it can throw.
+        try {
+            out.write(("omp: the guest start threw and was caught: $reason\n").toByteArray(Charsets.UTF_8))
+            out.flush()
+        } catch (ignored: Throwable) {
+            // Nothing. The record below is what `omp doctor` reads, and it is the whole of the
+            // promise this method makes.
+        }
+        startFailed(RealVfs(), paths, reason)
+    }
+
     private fun abiList(services: PlatformServices): List<String> =
         services.buildProperties()[Doctor.ABILIST]
             ?.split(',')

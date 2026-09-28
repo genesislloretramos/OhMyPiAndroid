@@ -87,6 +87,22 @@ enum class GuestState(val serving: Boolean) {
     /** The guest was started and no page came back on the reserved port. */
     APACHE_NOT_ANSWERING(false),
 
+    /**
+     * The start itself threw, and the throw was contained where the thread was started.
+     *
+     * **The state exists because the alternative is a process that dies.** The pattern is
+     * [omp.vm.guestapi.AgentUpdate]'s — a failure is a named outcome and a line and never a throw —
+     * and it holds here only because somewhere has agreed to catch. This build's four steps all do
+     * I/O (`omp.vm.provision.GuestPackages.install` runs `apt`, [omp.vm.provision.GuestServer] starts a
+     * process, [omp.vm.provision.GuestWeb.WebProbe] opens a socket, [omp.vm.guestapi.AgentUpdate]
+     * writes and parses a file another process may be writing) and none of them is guaranteed total,
+     * so a `catch` at the thread boundary turns a dead app into a report.
+     *
+     * [serving] is false, and the reason is in [omp.vm.provision.GuestStartReport.said] and in the
+     * record, so `omp doctor` names what threw rather than printing a state with nothing behind it.
+     */
+    START_FAILED(false),
+
     /** Apache is answering and the boot's `omp update` did not land, so the agent in it is unchanged. */
     AGENT_UPDATE_FAILED(true),
 
@@ -127,6 +143,11 @@ enum class GuestState(val serving: Boolean) {
             "the guest's own LAMP did not finish installing, so whatever is half on the disk is not " +
                 "a web server this build will start, and the chat the WebView was handed is this " +
                 "app's own loopback server; the Debian's origin was refused rather than replaced by it"
+        START_FAILED ->
+            "the start of the guest threw before it could say what it was doing, and the throw was " +
+                "caught where the app starts it rather than being allowed to close the app; the " +
+                "reason is on the line below, and the chat the WebView was handed is this app's own " +
+                "loopback server"
         APACHE_NOT_ANSWERING ->
             "the guest was started and nothing answered a request for this build's chat page on " +
                 "${GuestWeb.baseUrl(port)}, so the Debian's origin was refused rather than replaced " +
@@ -309,9 +330,29 @@ class GuestStart(
     /**
      * Bring the guest up, or say which of the six ways it is not up.
      *
-     * **Never throws and never blocks for longer than the update's own bound.** Every failure is a
-     * state and a line, because the alternative — an app that will not open because proot is not on
-     * this device — is the failure mode of a feature that has been given a stage at start-up.
+     * ### What is guaranteed here, and what is not
+     *
+     * **Every failure this method can recognise is a state and a line, and it never blocks for longer
+     * than the update's own bound.** No Debian, a port somebody else holds, a guest whose LAMP did
+     * not install, a server that would not start, a page that did not come back, an agent whose
+     * update did not land: all six are [GuestState]s, and a caller has a name to branch on.
+     *
+     * **It is not total, and it cannot be.** The four steps below do I/O —
+     * [omp.vm.provision.GuestPackages.install] runs `apt` through proot,
+     * [omp.vm.provision.GuestServer] starts a process, [omp.vm.provision.GuestWeb.WebProbe] opens a
+     * socket, and [omp.vm.guestapi.AgentUpdate] writes and parses a record another process may be
+     * writing — and none of those is wrapped here, because wrapping four seams one layer up would
+     * mean four catches with four shapes. **The types that can escape are the ordinary ones**:
+     * [java.io.IOException] from the filesystem and the socket, [omp.shell.fs.FsException] from the
+     * [omp.shell.fs.Vfs], and [IllegalStateException] or [IllegalArgumentException] from the
+     * proot-vector arithmetic this build does itself.
+     *
+     * **Where they are contained: nowhere in this class.** The caller is expected to catch at the
+     * thread boundary — `com.omp.terminal.vm.GuestRuntime` is the one that does — and to turn the
+     * throw into [startFailed] and therefore into [GuestState.START_FAILED]. **That is a contract on
+     * the caller and not an internal guarantee**, and it is written down here because the alternative
+     * is a promise the code does not keep: an unwrapped throw on a daemon thread reaches Android's
+     * default handler, and this app installs none of its own, so the process dies.
      */
     fun start(): GuestStartReport {
         val lines = ArrayList<String>()
@@ -543,6 +584,55 @@ fun notStarted(
         said = null,
         at = at,
         lines = listOf(reason),
+    )
+    return if (record(vfs, paths, report)) {
+        report
+    } else {
+        report.copy(
+            lines = report.lines + (
+                "this report could not be written to ${recordFile(paths)}, so 'omp doctor' will " +
+                    "have nothing to read about the guest's origin."
+                ),
+        )
+    }
+}
+
+/**
+ * A start that threw, turned into a report and a record the doctor can read.
+ *
+ * **The third way this layer says "not up", beside [notStarted] and [GuestStart.start]'s own states,
+ * and the only one whose subject is this app's own code rather than the device.** It exists so that a
+ * contained throw is a *state* and not a silence: an exception caught into a log that nothing reads
+ * is not a report, and a user whose guest threw must be able to run `omp doctor` and be told what
+ * threw.
+ *
+ * **The reason is [GuestStartReport.said] in its own words and is never a class name alone.**
+ * `omp doctor` quotes it on the `apache:` line, and a message from an [java.io.IOException] names the
+ * file, which is the whole of what can honestly be said about a phone this build has never run on.
+ * A message that is null becomes "no message" rather than an empty quotation.
+ */
+fun startFailed(
+    vfs: Vfs,
+    paths: ProvisionPaths,
+    reason: String,
+    port: Int = GuestWeb.RESERVED_PORT,
+    at: String = GuestStart.stamp(System.currentTimeMillis()),
+): GuestStartReport {
+    val report = GuestStartReport(
+        state = GuestState.START_FAILED,
+        port = port,
+        reserved = false,
+        launched = false,
+        answered = false,
+        update = null,
+        version = null,
+        said = reason,
+        at = at,
+        lines = listOf(
+            "the start of the guest threw and was caught where the app starts it: $reason. Nothing " +
+                "was downloaded and no guest is serving, and this app's own loopback server is the " +
+                "chat until a later start gets further.",
+        ),
     )
     return if (record(vfs, paths, report)) {
         report

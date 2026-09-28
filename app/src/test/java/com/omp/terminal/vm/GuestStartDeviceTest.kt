@@ -1,17 +1,26 @@
 package com.omp.terminal.vm
 
 
+import omp.shell.fs.RealVfs
 import omp.vm.guestapi.AgentUpdate
 import omp.vm.guestapi.UpdateRun
 import omp.vm.guestapi.UpdateTransport
 import omp.vm.provision.GuestLaunch
+import omp.vm.provision.GuestStartReport
+import omp.vm.provision.GuestState
 import omp.vm.provision.GuestWeb
 import omp.vm.provision.ProotLauncher
+import omp.vm.provision.ProvisionPaths
+import omp.vm.provision.readRecord
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 import java.io.OutputStream
 
 /**
@@ -171,6 +180,92 @@ class GuestStartDeviceTest {
         assertEquals(ProotProcessLauncher.TIMED_OUT, omp.vm.provision.GuestPackages.TIMED_OUT)
     }
 
+    // ---- the thread boundary, which is the one thing between a throw and a dead app ---------------
+
+    @Test
+    fun aGuestThreadThatThrowsComesBackAsAStateAndNotAsADeadProcess() {
+        // This is the whole of the guard. There is no default uncaught-exception handler in this app,
+        // so an exception on the `omp-guest-start` daemon thread reaches Android's and ends the
+        // process — a user sees the window open and then the app die, with nothing to explain it.
+        val paths = paths()
+        val boom = IllegalStateException("mkdir /data/user/0/com.omp.terminal/files/omp: Read-only file system")
+
+        val report = GuestRuntime.guard(paths, sink()) { throw boom }
+
+        assertEquals(GuestState.START_FAILED, report.state)
+        assertFalse("a throw is not a serving guest", report.serving)
+        assertTrue("the reason names the file, not just the type", report.said!!.contains("Read-only file system"))
+    }
+
+    @Test
+    fun aContainedThrowIsRecordedWhereTheDoctorReadsItAndNotOnlyInALog() {
+        // "An exception swallowed into a log that nothing reads is a silence." The record is what
+        // makes it a state: `omp doctor` runs in a second process and this is the only thing it can
+        // read about a start that threw.
+        val paths = paths()
+
+        GuestRuntime.guard(paths, sink()) { throw IOException("nativeLibraryDir is not a directory") }
+
+        val record = readRecord(RealVfs(), paths)!!
+        assertEquals(GuestState.START_FAILED.name, record.stateName)
+        assertEquals("IOException: nativeLibraryDir is not a directory", record.said)
+    }
+
+    @Test
+    fun anErrorIsContainedAsWellAsAnException() {
+        // A guest whose proot or its loader is not there produces a `NoClassDefFoundError` the first
+        // time anything touches it, and an `Error` on a daemon thread kills the process exactly as
+        // dead as an `IOException`. Catching `Exception` alone would not have saved this phone.
+        val report = GuestRuntime.guard(paths(), sink()) {
+            throw NoClassDefFoundError("libproot-loader.so")
+        }
+
+        assertEquals(GuestState.START_FAILED, report.state)
+        assertTrue(report.said!!.contains("NoClassDefFoundError"))
+        assertTrue(report.said!!.contains("libproot-loader.so"))
+    }
+
+    @Test
+    fun aLogStreamThatItselfThrowsDoesNotTurnAContainedFailureBackIntoAnUncontainedOne() {
+        // The one line the guard writes is a convenience, not the report. A stream that will not take
+        // it must not be allowed to rethrow out of the catch and undo the whole point.
+        val broken = object : OutputStream() {
+            override fun write(b: Int) = throw IOException("the log is closed")
+            override fun write(b: ByteArray, off: Int, len: Int) = throw IOException("the log is closed")
+            override fun flush() = throw IOException("the log is closed")
+        }
+
+        val report = GuestRuntime.guard(paths(), broken) { throw IllegalArgumentException("nope") }
+
+        assertEquals(GuestState.START_FAILED, report.state)
+        assertTrue(report.said!!.contains("IllegalArgumentException: nope"))
+    }
+
+    @Test
+    fun aStartThatSucceedsIsUnaffectedByTheGuard() {
+        // The happy path, checked because a guard that always returns a report would be a guard that
+        // has thrown the feature away. The report the body produced is the report that comes back,
+        // the same instance and not a copy.
+        val wanted = GuestStartReport(
+            state = GuestState.UP,
+            port = GuestWeb.RESERVED_PORT,
+            reserved = true,
+            launched = true,
+            answered = true,
+            update = omp.vm.guestapi.UpdateOutcome.ALREADY_CURRENT,
+            version = "18.3.5",
+            said = null,
+            at = "2026-09-28T10:00:00Z",
+            lines = listOf("an HTTP server returned this build's own chat document"),
+        )
+
+        val report = GuestRuntime.guard(paths(), sink()) { wanted }
+
+        assertTrue("the body's own report is returned, not a copy of it", wanted === report)
+        assertEquals(GuestState.UP, report.state)
+        assertTrue(report.serving)
+    }
+
     // ---- the marker the probe asks for -----------------------------------------------------------------------
 
     @Test
@@ -199,7 +294,16 @@ class GuestStartDeviceTest {
         assertTrue(refused.said!!.contains("ENOENT"))
     }
 
-    // ---- helpers ---------------------------------------------------------------------------------------------
+    // ---- helpers -----------------------------------------------------------------------------------
+
+    @get:Rule
+    val folder = TemporaryFolder()
+
+    /** A payload directory with nothing in it, which is what the guard's own report needs. */
+    private fun paths() = ProvisionPaths(folder.root.path, null, folder.root.path)
+
+    private fun sink(): ByteArrayOutputStream = ByteArrayOutputStream()
+
 
     /** `app/src/main/assets/web/index.html`, found by walking up from wherever the test was started. */
     private fun indexHtml(): File {

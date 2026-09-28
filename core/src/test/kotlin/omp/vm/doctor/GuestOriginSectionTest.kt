@@ -665,6 +665,73 @@ class GuestOriginSectionTest {
         )
     }
 
+
+    // ---- a start that threw, which is a state and not a silence ---------------------------------------
+
+    @Test
+    fun aStartThatWasCaughtAtTheThreadBoundaryIsNamedWithTheReasonThatThrew() {
+        // The end of the path: a throw inside `GuestStart` is caught by `com.omp.terminal.vm.GuestRuntime`,
+        // turned into `omp.vm.provision.startFailed`, and read back here in a second process. A
+        // failure caught into a log that nothing reads would be a silence, and this project has a
+        // rule about silences.
+        provisionGuest()
+        writeRecord(
+            GuestStart.KEY_STATE to GuestState.START_FAILED.name,
+            GuestStart.KEY_PORT to "$port",
+            GuestStart.KEY_RESERVED to "no",
+            GuestStart.KEY_LAUNCHED to "no",
+            GuestStart.KEY_ANSWERED to "no",
+            GuestStart.KEY_SAID to "NoClassDefFoundError: libproot-loader.so",
+        )
+
+        val report = doctor().report()
+
+        assertEquals(
+            report.text(),
+            say(
+                "state",
+                "${GuestState.START_FAILED.name}: the start of the guest threw before it could say " +
+                    "what it was doing, and the throw was caught where the app starts it rather " +
+                    "than being allowed to close the app; the reason is on the line below, and the " +
+                    "chat the WebView was handed is this app's own loopback server",
+            ),
+            line(report, "state"),
+        )
+        // The reason, in its own words, on the line the report always uses for the guest's last line.
+        assertEquals(
+            report.text(),
+            say(
+                "apache",
+                "not started: the start launched nothing inside the Debian; the guest's own last " +
+                    "line was \"NoClassDefFoundError: libproot-loader.so\"",
+            ),
+            line(report, "apache"),
+        )
+    }
+
+    @Test
+    fun aStartThatThrewIsNeverTheOrigin() {
+        // The same rule as PORT_TAKEN, and the reason it is worth a test of its own: a throw is the
+        // failure a user is least likely to understand and the one most likely to be swallowed.
+        provisionGuest()
+        writeRecord(
+            GuestStart.KEY_STATE to GuestState.START_FAILED.name,
+            GuestStart.KEY_ANSWERED to "no",
+        )
+
+        val report = doctor().report()
+
+        assertEquals(
+            report.text(),
+            say(
+                "origin",
+                "this app's own loopback server: Apache inside the Debian is not answering: " +
+                    GuestState.START_FAILED.name,
+            ),
+            chatLine(report, "origin"),
+        )
+    }
+
     // ---- helpers ---------------------------------------------------------------------------------------------
 
     private fun doctor() = Doctor(services, RealVfs(), paths, probe = Doctor.Probe { false })
