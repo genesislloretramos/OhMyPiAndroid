@@ -13,6 +13,13 @@
     <!-- The chat server: a foreground service that holds a loopback socket open. FOREGROUND_SERVICE
          alone, because the type is specialUse and not dataSync — see the <service> below. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14 asks for one permission per foreground service type, and this one is not
+         optional: with targetSdk 34 or above the platform refuses startForeground for a type
+         whose permission is missing, and it refuses it by throwing out of onCreate — which kills
+         the process during launch. That is how the last release of this app shipped: it
+         installed, it launched, and it showed nothing. It reads as a duplicate of the line above
+         and is not one; do not tidy it away. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- Without this the notification a foreground service is required to show is not shown on
          API 33+, which would leave the user with a service they cannot see and cannot stop. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />

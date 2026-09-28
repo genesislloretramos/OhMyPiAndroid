@@ -16,6 +16,7 @@ import com.omp.terminal.web.AssetSource
 import com.omp.terminal.web.ChatApi
 import com.omp.terminal.web.LocalServer
 import omp.vm.provision.ProvisionStatusHolder
+import omp.vm.web.ChatServerStatusHolder
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -29,6 +30,23 @@ import java.util.concurrent.atomic.AtomicBoolean
  * phone, talking to a conversation folder in the user's own storage. Closing the Activity leaves it
  * running, which is the point of a foreground service; stopping it from the notification takes the
  * port back, which is the point of having a stop button.
+ *
+ * ### When the platform says no
+ *
+ * **This service is asked for, not promised.** The platform can refuse a foreground service — for
+ * a type whose permission is missing from the manifest, or for an app that is not allowed to
+ * start one at all — and [onCreate] treats that refusal as an answer rather than as a failure of
+ * the app: the reason is recorded in [ChatServerStatusHolder], the service stops itself, and the
+ * process carries on. `web` and `omp doctor` print that reason, so "the chat server is not
+ * running" is followed by the sentence that says which of those two happened.
+ *
+ * **What that costs is the browser front end and nothing else**, because that is the only thing
+ * behind this socket: the terminal, the shell thread, the guest and the conversations in
+ * Documents/omp are all reachable with the server stopped, and the app opens either way. The
+ * version of this that did not survive its own first launch — a `SecurityException` out of
+ * [onCreate] with no catch — is the reason the guard is here and the reason
+ * `MergedManifestTest` reads the merged manifest rather than this file, and that is the only file
+ * on this bug that the device actually reads.
  *
  * ### What the notification says
  *
@@ -96,19 +114,62 @@ class ChatService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        ChatServerStatusHolder.starting()
         val channel = notificationChannel()
         // The channel is made before the server is bound, not after: startForeground has to be the
         // first thing this service does, and a notification on a channel that does not exist yet is
         // a notification the system drops on the floor on some releases.
         val first = notification(channel, "starting the server…", null)
-        if (Build.VERSION.SDK_INT >= 29) {
-            // The type is not decoration on Android 14: a foreground service that declares one in
-            // its manifest and not in this call is refused, and the app dies with a stack trace
-            // that says nothing useful to whoever installed it.
-            startForeground(NOTIFICATION_ID, first, foregroundType(Build.VERSION.SDK_INT))
-        } else {
-            startForeground(NOTIFICATION_ID, first)
+        // Everything the platform can refuse to this service is inside this one `try`, and nothing
+        // inside it is allowed out. An uncaught exception in `Service.onCreate` takes the process
+        // with it, and the symptom of that is an app that installs, launches and shows nothing,
+        // with a stack trace nobody reading it owns — which is exactly what a missing
+        // FOREGROUND_SERVICE_SPECIAL_USE did to a shipped build of this app. The terminal does not
+        // need this service, so a refusal has to cost the browser front end and nothing else.
+        //
+        // The second catch is `IllegalStateException` and not `ForegroundServiceStartNotAllowedException`
+        // by name, on purpose: that class only exists from API 31, and a catch clause naming a
+        // class that is not on an older device's boot class path fails verification on exactly the
+        // devices this app still supports. It is the class the platform throws when the app is not
+        // allowed to start a foreground service at all, and the reason below carries the class's
+        // own name so that nothing is lost by not naming the type here.
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                // The type is not decoration on Android 14: a foreground service that declares one
+                // in its manifest and not in this call is refused, and so is one whose type has no
+                // permission beside it. `ChatServiceManifestTest` is what keeps the first honest
+                // against the merged manifest.
+                startForeground(NOTIFICATION_ID, first, foregroundType(Build.VERSION.SDK_INT))
+            } else {
+                startForeground(NOTIFICATION_ID, first)
+            }
+        } catch (e: SecurityException) {
+            refuse("SecurityException: ${e.message}")
+        } catch (e: IllegalStateException) {
+            refuse("ForegroundServiceStartNotAllowedException: ${e.message}")
         }
+    }
+
+    /**
+     * The platform would not let this service run in the foreground, and that is now a state with
+     * a reason rather than a crash.
+     *
+     * **Three things, in this order, and none of them is throwing.** The reason goes to
+     * [ChatServerStatusHolder], which is where `web`, the Activity and `omp doctor` read it from;
+     * it goes to the log, because a device this old is somebody's spare phone and the log is the
+     * only copy; and the service stops itself, which is what the platform's own documentation says
+     * to do after a refused `startForeground` — the service was started as a foreground service,
+     * so the one way to be a well-behaved instance of that is to go away rather than sit there
+     * without the notification it promised.
+     *
+     * **The cost is the browser front end and nothing else.** `web` and `omp doctor` say the
+     * server is not running and print this sentence; the shell, the guest and the conversations
+     * are untouched, because none of them is behind this socket.
+     */
+    private fun refuse(reason: String) {
+        ChatServerStatusHolder.refused(reason)
+        android.util.Log.w(TAG, "the chat server is not running: $reason")
+        stopSelf()
     }
 
     /**
@@ -184,11 +245,14 @@ class ChatService : Service() {
         // and the OS may have given a different one, and a `web` command that printed the
         // preference would be printing something that might not be listening.
         try {
-            File(home, URL_FILE).writeText(url!! + "\n", Charsets.UTF_8)
+            urlFile(applicationContext.filesDir).writeText(url!! + "\n", Charsets.UTF_8)
         } catch (e: IOException) {
             android.util.Log.w(TAG, "the url could not be written down: ${e.message}")
         }
         android.util.Log.i(TAG, "chat server on $url")
+        // A refusal, if there was one, is over: the server is up and the state says so, so a
+        // device that failed once and then worked is not still reporting the first failure.
+        ChatServerStatusHolder.bound(url!!)
         show(channel, null)
         watchProvisioning()
         return url
@@ -224,21 +288,18 @@ class ChatService : Service() {
      */
     private fun watchProvisioning() {
         val thread = Thread({
-            var shown: String? = null
             val channel = notificationChannel()
-            while (watching) {
-                try {
-                    Thread.sleep(WATCH_MS)
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    return@Thread
-                }
-                if (!watching) return@Thread
-                val line = ProvisionStatusHolder.current.line()
-                if (line == shown) continue
-                shown = line
-                show(channel, line)
-            }
+            // The loop is handed its reader, its publisher and its ticker rather than closing over
+            // them, so a JVM test can make any one of the three throw and watch the loop end
+            // instead of the process. Nothing is allowed to escape that `run` — an uncaught
+            // exception in any thread ends the app, and this one is not worth the terminal.
+            val reason = ProvisionWatcher(
+                watching = { watching },
+                nextLine = { ProvisionStatusHolder.current.line() },
+                publish = { show(channel, it) },
+                sleep = { Thread.sleep(WATCH_MS) },
+            ).run()
+            if (reason != null) android.util.Log.w(TAG, reason)
         }, "omp-provision-watch")
         thread.isDaemon = true
         watching = true
@@ -257,11 +318,15 @@ class ChatService : Service() {
         server = null
         started.set(false)
         // The URL goes with it: a file naming a port that is no longer bound is a claim this app
-        // would not make, and `web` reads that file to decide whether the service is running.
-        try {
-            File(File(servicesDir(), WEB_DIR), URL_FILE).delete()
-        } catch (e: IOException) {
-        }
+        // would not make, and `web` and `omp doctor` both read that file to decide whether the
+        // service is running. One `forgetUrl`, which is the same function that names the file the
+        // bind writes it — the two used to be spelled separately, the deleter with one `web` too
+        // many, and the file outlived the server that had written it.
+        forgetUrl(applicationContext.filesDir)
+        // `stopped` and not `clear`: a service the platform refused stops itself in the same
+        // breath, and erasing the reason on the way out would throw away the only record of it
+        // that this process will ever have.
+        ChatServerStatusHolder.stopped()
         super.onDestroy()
     }
 
@@ -357,7 +422,7 @@ class ChatService : Service() {
         }
 
     /** Where the token and the URL are kept, inside the app's own private files. */
-    private fun servicesDir(): File = File(applicationContext.filesDir, WEB_DIR)
+    private fun servicesDir(): File = webDir(applicationContext.filesDir)
 
     private fun versionName(): String = try {
         packageManager.getPackageInfo(packageName, 0).versionName ?: "1.0"
@@ -374,6 +439,37 @@ class ChatService : Service() {
         private const val TOKEN_FILE = "token"
         private const val URL_FILE = "url"
         private const val LOGIN_PATH = "/login"
+
+        /**
+         * The three paths this service's private files live at, named in one place.
+         *
+         * **One function per file, and the writer and the deleter use the same one**, because the
+         * bug this replaces was two spellings of the same path in one class: the bind wrote
+         * `filesDir/web/url` and the teardown deleted `filesDir/web/web/url`, so the URL survived
+         * the server and `omp web` went on naming a port that nothing was listening on. A path
+         * spelled once cannot drift from itself, and a JVM test can check the spelling against
+         * the convention the shell reads it by — `appFilesDir()/web/url`, which is what
+         * `omp.vm.doctor.Doctor.URL_FILE` and `WebCommand` both use.
+         *
+         * They take the app's **files** directory and not the services directory, so the `web`
+         * component is added here and nowhere else; `servicesDir()` is the same thing.
+         */
+        fun webDir(filesDir: File): File = File(filesDir, WEB_DIR)
+
+        /** The published URL: `filesDir/web/url`, as `omp web` and `omp doctor` read it. */
+        fun urlFile(filesDir: File): File = File(webDir(filesDir), URL_FILE)
+
+        /** The token: `filesDir/web/token`, which is a different file and is never deleted. */
+        fun tokenFile(filesDir: File): File = File(webDir(filesDir), TOKEN_FILE)
+
+        /**
+         * Takes the published URL back off the disk, and is called from [onDestroy].
+         *
+         * **It returns whether there was one**, which is a fact about the filesystem and not
+         * about the server: a service that never bound a port has nothing to take back, and a
+         * caller that wanted to know the difference can have it.
+         */
+        fun forgetUrl(filesDir: File): Boolean = urlFile(filesDir).delete()
 
         /**
          * How often the watcher looks at the provisioning status, in milliseconds.
@@ -401,6 +497,20 @@ class ChatService : Service() {
          * against [foregroundType].
          */
         const val FOREGROUND_TYPE = "specialUse"
+
+        /**
+         * The permission Android 14 checks a `specialUse` start against, named here for the same
+         * reason [FOREGROUND_TYPE] is: the manifest cannot read a Kotlin value, so a constant and
+         * a test are the only way to hold the two spellings together.
+         *
+         * **It is a permission in its own right and not a spelling of `FOREGROUND_SERVICE`.** The
+         * type-specific one is checked *in addition to* the general one when `targetSdk` is 34 or
+         * above, and leaving it out is not a build error or a lint warning — it is a `SecurityException`
+         * thrown out of [onCreate] on a device with Android 14 on it, which is how the last release
+         * of this app installed, launched and showed nothing. `MergedManifestTest` reads the merged
+         * manifest for it, because that is the file the device reads.
+         */
+        const val SPECIAL_USE_PERMISSION = "android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
 
         /**
          * The type bit passed to `startForeground`, for an API level.
@@ -442,8 +552,7 @@ class ChatService : Service() {
          * also what `web` reads. One fact, written once, asked for by whoever needs it.
          */
         fun publishedUrl(context: Context): String? =
-            File(File(context.filesDir, WEB_DIR), URL_FILE)
-                .takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotEmpty() }
+            urlFile(context.filesDir).readPublished()
 
         /**
          * This install's token, or null before the first start.
@@ -452,14 +561,40 @@ class ChatService : Service() {
          * to be handed would be the one that worked while the other silently did not.
          */
         fun publishedToken(context: Context): String? =
-            File(File(context.filesDir, WEB_DIR), TOKEN_FILE)
-                .takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotEmpty() }
+            tokenFile(context.filesDir).readPublished()
 
-        /** Stops the host, the way the notification's Stop action does. */
-        fun stop(context: Context) {
-            context.startService(
+        /**
+         * Stops the host, the way the notification's Stop action does.
+         *
+         * **`stopService` and not `startService` with an action, which is what this used to be.**
+         * The one caller is `omp web stop`, which runs on the shell thread and can run with the
+         * Activity closed or the screen off — and from API 26 an app in the background may not
+         * start a service at all, so the old spelling threw `IllegalStateException` out of a
+         * command a user had every right to run. Branching to `startForegroundService` instead
+         * would trade that for a worse fault: it *starts* a service, so a `web stop` against a
+         * server that is not running would light up a notification and a foreground service for
+         * a stop, and on API 31+ a background start is refused outright.
+         *
+         * **Asking the platform to stop is the third option, and it is the one the platform made
+         * for this**: the running instance is told to go away and tears itself down through the
+         * same [onDestroy] any other stop reaches, with no exemption needed because nothing is
+         * being started. It is a no-op, and returns false, on a service that was not running —
+         * which is the honest answer to `web stop` twice.
+         */
+        fun stop(context: Context): Boolean =
+            context.stopService(
                 Intent(context, ChatService::class.java).setAction(ACTION_STOP),
             )
+
+        /**
+         * What a published file says, or null when there is no file, it is empty, or it cannot be
+         * read — a file this app wrote and cannot read is not a fact to hand out.
+         */
+        private fun File.readPublished(): String? = try {
+            takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotEmpty() }
+        } catch (e: IOException) {
+            android.util.Log.w(TAG, "$name could not be read: ${e.message}")
+            null
         }
     }
 }

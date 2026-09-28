@@ -4,6 +4,7 @@ import com.omp.terminal.ChatService
 import omp.shell.exec.Command
 import omp.shell.exec.CommandSpec
 import omp.shell.exec.ExecContext
+import omp.vm.web.ChatServerStatusHolder
 import java.io.File
 
 /**
@@ -61,6 +62,11 @@ object WebCommand : Command {
         val url = if (up) said else ""
         ctx.outLine("omp: the agent's web front end")
         ctx.outLine("  state:       ${if (up) "running" else "not running"}")
+        // The reason, when there is one, printed on the line under the state it belongs to: a
+        // "not running" on its own is what a user already knew, and the sentence under it is the
+        // platform's own — the one that names the permission. Only a refused service has one, so
+        // a server that is merely stopped says nothing here beyond having been stopped.
+        ChatServerStatusHolder.current.line()?.let { ctx.outLine("  refused:     $it") }
         if (up) {
             ctx.outLine("  url:         $url")
             ctx.outLine("  token:       ${token.ifEmpty { "(not on disk)" }}")

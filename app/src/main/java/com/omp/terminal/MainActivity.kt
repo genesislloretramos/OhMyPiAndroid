@@ -97,7 +97,23 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
         // of it being a foreground service, and stopping it from the notification takes the port
         // back without touching the shell. `start` is idempotent, so a rotation asks for nothing
         // that is not already running.
-        ChatService.start(this)
+        //
+        // **And a failure to start is not allowed to reach `finish()`.** This Activity's own work
+        // — the screen, the shell thread below, the guest after that — is started on this thread
+        // and depends on nothing that is behind this socket, so the one thing a start failure may
+        // cost is the browser front end. The independence is not an accident: the terminal, the
+        // VM, `omp doctor` and the conversations in Documents/omp are all reachable with the chat
+        // server stopped, which is why an uncaught throw here used to take a working terminal
+        // down with a server that had already refused to start.
+        try {
+            ChatService.start(this)
+        } catch (e: RuntimeException) {
+            // `startForegroundService` throws SecurityException for a missing FOREGROUND_SERVICE
+            // and IllegalStateException when the platform will not allow a start at all; both are
+            // RuntimeExceptions, and neither is a fault in anything this Activity is about.
+            Log.w("omp-ui", "the chat server could not be asked for: ${e.javaClass.simpleName}: ${e.message}")
+            flashStatus("the chat server could not be started; the terminal is unaffected")
+        }
         askForNotificationPermission()
 
         val cellHeight = services.prefInt(PREF_CELL_HEIGHT, 0)
@@ -403,22 +419,50 @@ class MainActivity : Activity(), ExtraKeysView.Listener, SessionHost {
     private fun defaultCellHeightPx(): Int =
         (TerminalView.DEFAULT_CELL_DP * resources.displayMetrics.density).toInt()
 
+    /**
+     * The frame loop: one pass every [FRAME_MS], and the thing that keeps this Activity alive.
+     *
+     * **The whole body is inside one `try`, and the reschedule is in a `finally`.** This runs on
+     * the main thread, where an uncaught exception is not a failed frame but a dead process: the
+     * symptom is an app that was working a moment ago and is now gone, with nothing on screen and
+     * no clue why. The parts of a pass that can throw are all about the *chat* — deciding which
+     * origin serves it asks the guest's record and this service's published URL — and the
+     * terminal in the same pass does not depend on any of it, so a failure there has to cost a
+     * status line and nothing else.
+     *
+     * **The loop keeps running after a failure**, because that is the other half of the promise:
+     * dropping the reschedule would leave a terminal that still draws nothing and never says why.
+     * A pass that throws is logged with its class and message, which is what a report needs, and
+     * the next pass is sixteen milliseconds away.
+     *
+     * **The exit path is the one thing that does not come back**, and `going` is how that is said
+     * without a `return` out of a `try` whose `finally` would then re-post to a dead Activity: the
+     * user asked to leave.
+     */
     private val poll = object : Runnable {
         override fun run() {
-            // Only the root session's `exit` means "close the app". A nested one that exits is a
-            // user leaving the VM, and finishing here would drop them out of the terminal entirely.
-            if (shell.session.exitRequested) {
-                finish()
-                return
+            var going = true
+            try {
+                // Only the root session's `exit` means "close the app". A nested one that exits is a
+                // user leaving the VM, and finishing here would drop them out of the terminal entirely.
+                if (shell.session.exitRequested) {
+                    finish()
+                    going = false
+                    return
+                }
+                // The one thing this loop asks that is not about the screen. A volatile read and one
+                // comparison: the guest start is on its own thread and this is how the main thread
+                // learns it finished. `originDue` is false after the first decision, so the rest of the
+                // life of this Activity costs one boolean read per frame.
+                if (originDue()) decideUiOrigin()
+                if (screen.isDirty()) terminal.requestRedraw()
+                persistCellHeight()
+            } catch (e: Exception) {
+                Log.w("omp-ui", "a frame failed and the loop carried on: ${e.javaClass.simpleName}: ${e.message}")
+                flashStatus("something the chat does went wrong; the terminal is unaffected")
+            } finally {
+                if (going) ui.postDelayed(this, FRAME_MS)
             }
-            // The one thing this loop asks that is not about the screen. A volatile read and one
-            // comparison: the guest start is on its own thread and this is how the main thread
-            // learns it finished. `originDue` is false after the first decision, so the rest of the
-            // life of this Activity costs one boolean read per frame.
-            if (originDue()) decideUiOrigin()
-            if (screen.isDirty()) terminal.requestRedraw()
-            persistCellHeight()
-            ui.postDelayed(this, FRAME_MS)
         }
     }
 
