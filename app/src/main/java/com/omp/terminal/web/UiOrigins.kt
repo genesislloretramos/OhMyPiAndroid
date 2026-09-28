@@ -77,6 +77,13 @@ object UiOrigins {
      * base gives null rather than a base URL with a blank in it, because
      * [HttpLoopback.Base.parse] refuses the second and the refusal would arrive as a crash on a
      * phone instead of as "there is nothing to show yet".
+     *
+     * **A base read off the disk is untrusted input here, exactly as the token's absence is.** A
+     * file can hold a line from an older build, a half-written write, or a hand-edited one, and
+     * [HttpLoopback.Base.parse] refuses all of those — so the refusal is caught here and answered
+     * with the same null, because the only difference between "not published yet" and "published
+     * something this build cannot serve" is a word in a status line, and a phone that dies on
+     * launch over it is worse than a screen that says it is still waiting.
      */
     fun choose(
         state: ProvisionState,
@@ -85,7 +92,9 @@ object UiOrigins {
         loopbackBase: String?,
     ): UiOrigin? {
         if (loopbackBase == null || token == null) return null
-        val loopback = LoopbackOrigin(loopbackBase, token)
+        // A base that came off the disk is untrusted input, and the refusal is a null the caller
+        // can carry on from. See the KDoc on [publishedBase].
+        val loopback = runCatching { LoopbackOrigin(loopbackBase, token) }.getOrNull() ?: return null
         val guest = if (guestServing) GuestOrigin(GuestWeb.baseUrl(GUEST_UI_PORT), token) else null
         return UiOrigin.choose(state, guest, loopback)
     }
@@ -100,8 +109,21 @@ object UiOrigins {
      * taking everything after the scheme would carry the credential into a base URL that is then
      * validated — so a mistake here would be a mistake the validation cannot see.
      */
-    private fun publishedBase(context: Context): String? {
-        val url = ChatService.publishedUrl(context) ?: return null
-        return url.substringAfter("://", "").substringBefore('/').takeIf { it.isNotEmpty() }
+    private fun publishedBase(context: Context): String? = publishedBaseOf(ChatService.publishedUrl(context))
+
+    /**
+     * [publishedBase] over the text itself, so the line between a file and an origin can be asked
+     * on a JVM.
+     *
+     * **Split out for one reason: this is the step the tests could not reach.** [choose] is a
+     * function of four values and was tested as one, but the base it is handed was always a
+     * literal someone typed, so the only place a published URL was ever turned into a base — the
+     * one place a scheme can be dropped — had no test at all, and the validator downstream only
+     * proved it was strict. One `String` in, one `String?` out, and the whole of it is askable.
+     */
+    fun publishedBaseOf(url: String?): String? {
+        val scheme = url?.substringBefore("://", "").orEmpty()
+        val hostAndPort = url?.substringAfter("://", "").orEmpty().substringBefore('/')
+        return "$scheme://$hostAndPort".takeIf { scheme.isNotEmpty() && hostAndPort.isNotEmpty() }
     }
 }

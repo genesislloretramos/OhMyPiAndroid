@@ -4,6 +4,7 @@ import omp.vm.provision.GuestWeb
 import omp.vm.provision.ProvisionState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -27,6 +28,9 @@ class UiOriginsTest {
     private val token = "0123456789ABCDEFGHJKMNPQ"
     private val loopbackBase = "http://127.0.0.1:8731"
     private val guestBase = GuestWeb.baseUrl(GuestWeb.RESERVED_PORT)
+
+    /** What [omp.terminal.web.AccessToken] mints: 26 bytes of `SecureRandom`, 43 base32 characters. */
+    private val publishedToken = "7KQ3FJR8W2XPD5M9ZTVHB4YN6SC0AG1EHV3RJQXRVG7"
 
     // ---- the gate ------------------------------------------------------------------------------------
 
@@ -132,5 +136,75 @@ class UiOriginsTest {
         assertEquals("$guestBase/login?t=$token", guest!!.url())
         // And the WebView adds nothing: no header, no injected script, no evaluateJavascript.
         assertFalse(guest.url().contains("omp"))
+    }
+
+    // ---- the line between a file and an origin ---------------------------------------------------------
+
+    @Test
+    fun thePublishedUrlBecomesABaseThatKeepsItsSchemeAndLosesItsPathAndItsToken() {
+        // The exact text `ChatService` writes: `LocalServer.url()` plus `/login?t=` plus the token
+        // it minted, which is 26 bytes of `SecureRandom` as 43 Crockford base32 characters.
+        val written = "http://127.0.0.1:8731/login?t=$publishedToken"
+
+        val base = UiOrigins.publishedBaseOf(written)
+
+        // The scheme stays. `HttpLoopback.Base.parse` takes the scheme from before `://` and
+        // refuses anything that is not `http`, so a base that has lost it is not a base at all —
+        // and this is the whole of what used to be missing, one line, on every launch.
+        assertEquals("http://127.0.0.1:8731", base)
+        assertFalse("a base is a scheme, a host and a port and nothing else", base!!.contains("/login"))
+        assertFalse("the credential in the file is not carried into an origin", base.contains(publishedToken))
+    }
+
+    @Test
+    fun aPublishedUrlWithNoPathIsAlreadyItsOwnBase() {
+        // The shape an earlier build could have written, and the one a hand-edited file holds. The
+        // first `/` is the one after the scheme, so a URL with no path at all comes back whole.
+        assertEquals("http://127.0.0.1:8731", UiOrigins.publishedBaseOf("http://127.0.0.1:8731"))
+        assertEquals("http://127.0.0.1:8731", UiOrigins.publishedBaseOf("http://127.0.0.1:8731/"))
+    }
+
+    @Test
+    fun thereIsNoBaseInAnEmptyOrBlankPublishedUrl() {
+        // Null rather than an empty string. `choose` hands whatever comes out of here to
+        // `HttpLoopback.Base.parse`, and an empty base would be a URL with no scheme in it — the
+        // same refusal, arrived at from the other side.
+        assertNull(UiOrigins.publishedBaseOf(null))
+        assertNull(UiOrigins.publishedBaseOf(""))
+        assertNull(UiOrigins.publishedBaseOf("   "))
+    }
+
+    @Test
+    fun aBaseThatCameOffTheDiskChoosesTheLoopbackAndDoesNotCrashTheCaller() {
+        // End to end, and the seam that was open. Every other test in this file handed `choose` a
+        // base someone had typed, which is why the validator being strict was never the same
+        // thing as the base being right: this is the first test that builds one the way the app
+        // does, from the text on the disk.
+        val base = UiOrigins.publishedBaseOf("http://127.0.0.1:8731/login?t=$publishedToken")
+        assertNotNull(base)
+
+        // A phone that has provisioned nothing, which is the state of every device in the first
+        // seconds of its life and the one this crash happened in.
+        val chosen = try {
+            UiOrigins.choose(ProvisionState.NONE, guestServing = false, token, base)
+        } catch (e: IllegalArgumentException) {
+            throw AssertionError("a base read off the disk killed the caller instead of answering: $base", e)
+        }
+
+        assertTrue("a device with no guest still has this app's own server", chosen is LoopbackOrigin)
+        assertEquals("http://127.0.0.1:8731", (chosen as LoopbackOrigin).base.text)
+    }
+
+    @Test
+    fun aBaseOffTheDiskThatThisBuildCannotServeIsNothingToShowYetAndNotACrash() {
+        // The same trust applied one step further. A file from an older build, a half-written line
+        // or a hand-edited one is refused by the validator, and the refusal is a null the caller
+        // can carry on from rather than an exception on a `Handler` post.
+        for (bad in listOf("127.0.0.1:8731", "http://127.0.0.1", "", "https://127.0.0.1:8731")) {
+            assertNull(
+                "an unservable base must be a null and not a crash: '$bad'",
+                UiOrigins.choose(ProvisionState.NONE, guestServing = false, token, bad),
+            )
+        }
     }
 }
